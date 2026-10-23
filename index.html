@@ -103,6 +103,7 @@ body.modal-open .fab{display:none}
 .card-img img,.hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .planned-pill,.src-pill{position:absolute;top:10px;background:rgba(255,255,255,.95);color:var(--text);font-size:14px;font-weight:800;padding:4px 10px;border-radius:999px;box-shadow:var(--shadow)}
 .planned-pill{left:10px} .src-pill{right:10px}
+.review-pill{position:absolute;bottom:10px;left:10px;background:var(--warn-border);color:#fff;font-size:14px;font-weight:800;padding:4px 10px;border-radius:999px}
 .card-body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:8px;width:100%}
 .card h3{margin:0;font-size:19px}
 .meta{display:flex;gap:14px;color:var(--muted);font-weight:700;font-size:16px;flex-wrap:wrap;align-items:center}
@@ -302,7 +303,6 @@ pre.code{background:#2A1F16;color:#FDF3E4;padding:16px;border-radius:12px;overfl
       <button data-action="nav" data-view="library"><span class="ico" aria-hidden="true">📖</span>Rezepte</button>
       <button data-action="nav" data-view="planner"><span class="ico" aria-hidden="true">📅</span>Woche</button>
       <button data-action="nav" data-view="grocery"><span class="ico" aria-hidden="true">🛒</span>Einkauf</button>
-      <button data-action="nav" data-view="import"><span class="ico" aria-hidden="true">📥</span>Import</button>
       <button data-action="nav" data-view="settings"><span class="ico" aria-hidden="true">⚙️</span>Mehr</button>
     </nav>
   </div>
@@ -397,8 +397,8 @@ const SCHEMA = {
     "plan": {"$ref": "#/$defs/WeekPlan"},
     "checked": {"type": "object", "additionalProperties": {"type": "boolean"}},
     "settings": {"type": "object", "properties": {
-      "geminiKey": {"type": "string", "description": "Nur lokal gespeichert"},
-      "model": {"type": "string"}, "unitMode": {"enum": ["original","metric"]},
+      "apiBase": {"type": "string", "description": "Adresse des Rezept-Servers, leer = Standard"},
+      "analyzeVideo": {"type": "boolean"}, "unitMode": {"enum": ["original","metric"]},
       "lastFolderIds": {"type": "array", "items": {"$ref": "#/$defs/Id"}}, "lastBackup": {"type": ["string","null"]}}}
   },
   "$defs": {
@@ -516,7 +516,7 @@ function I(quantity, unit, name, aisle, note, original){
 }
 function S(text){ return {id:uid(), text}; }
 function emptyPlan(){ return Object.fromEntries(DAYS.map(([d]) => [d, {breakfast:null, lunch:null, dinner:null}])); }
-function defaultSettings(){ return {geminiKey:'', model:'gemini-flash-latest', unitMode:'original', analyzeVideo:true, lastFolderIds:[], lastBackup:null}; }
+function defaultSettings(){ return {apiBase:'', unitMode:'original', analyzeVideo:true, lastFolderIds:[], lastBackup:null}; }
 
 function seedState(){
   const now = new Date().toISOString();
@@ -576,20 +576,41 @@ function migrate(s){
     ingredients:r.ingredients.map(i => ({...i, original:i.original || composeLine(i)}))}));
   return {version:VERSION, recipes, folders:s.folders || [], plan, checked:s.checked || {}, settings:Object.assign(defaultSettings(), s.settings || {})};
 }
-function load(){
-  try { const s = JSON.parse(localStorage.getItem(STORAGE_KEY)); if (!s || !Array.isArray(s.recipes)) return null; return migrate(s); }
-  catch { return null; }
+/* Speicher: IndexedDB (Platz für Bilder); ältere Stände aus localStorage werden übernommen. */
+let dbPromise = null;
+function idb(){
+  dbPromise = dbPromise || new Promise((res, rej) => {
+    const r = indexedDB.open('mise-en-place', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  return dbPromise;
 }
-let saveFailed = false;
-function save(){
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); saveFailed = false; }
-  catch { if (!saveFailed) toast('⚠ Speichern im Browser fehlgeschlagen – bitte Backup exportieren.'); saveFailed = true; }
+async function idbGet(key){ const db = await idb(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(key); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
+async function idbSet(key, val){ const db = await idb(); return new Promise((res, rej) => { const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(val, key); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
+let saveFailed = false, ready = false;
+async function persist(){
+  if (!ready) return;
+  try { await idbSet('state', JSON.parse(JSON.stringify(state))); saveFailed = false; try { localStorage.removeItem(STORAGE_KEY); } catch {} }
+  catch {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); saveFailed = false; }
+    catch { if (!saveFailed) toast('⚠ Speichern fehlgeschlagen – bitte Backup exportieren.'); saveFailed = true; }
+  }
+}
+function save(){ persist(); }
+async function boot(){
+  let s = null;
+  try { s = await idbGet('state'); } catch {}
+  if (!s) { try { s = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch {} }
+  state = s && Array.isArray(s.recipes) ? migrate(s) : seedState();
+  ready = true; save();
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
+  render();
+  handleIncoming();
 }
 
-let state = load() || seedState();
-save();
-try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
-const ui = {view:'library', q:'', meal:'all', folder:'all', quick:false, hideChecked:false, importText:'', importUrl:'', lastReport:null};
+let state = seedState();
+const ui = {view:'library', q:'', meal:'all', folder:'all', quick:false, hideChecked:false};
 
 const byId = id => state.recipes.find(r => r.id === id);
 const folderById = id => state.folders.find(f => f.id === id);
@@ -606,7 +627,7 @@ function folderBadges(r){ return (r.folderIds || []).map(folderById).filter(Bool
 /* =========================================================
    RENDERING
    ========================================================= */
-const views = {library:viewLibrary, planner:viewPlanner, grocery:viewGrocery, import:viewImport, settings:viewSettings};
+const views = {library:viewLibrary, planner:viewPlanner, grocery:viewGrocery, settings:viewSettings};
 function render(){
   document.getElementById('view').innerHTML = views[ui.view]();
   document.querySelectorAll('.nav button').forEach(b => { if (b.dataset.view === ui.view) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
@@ -659,13 +680,13 @@ function filteredRecipes(){
 function libraryResults(){
   const list = filteredRecipes();
   if (!list.length) return `<div class="empty"><div class="big" aria-hidden="true">🥄</div><p><strong>Keine passenden Rezepte.</strong></p>
-    <div class="btn-row" style="justify-content:center"><button class="btn secondary" data-action="clear-filters">Filter zurücksetzen</button><button class="btn primary" data-action="nav" data-view="import">📥 Rezept importieren</button></div></div>`;
+    <div class="btn-row" style="justify-content:center"><button class="btn secondary" data-action="clear-filters">Filter zurücksetzen</button><button class="btn primary" data-action="add-recipe">＋ Rezept per Link</button></div></div>`;
   return `<p class="count-line">${list.length} Rezept${list.length === 1 ? '' : 'e'}</p><div class="grid">${list.map(card).join('')}</div>`;
 }
 function card(r){
   const p = plannedIn(r.id), pf = PLATFORMS[r.sourcePlatform];
   return `<button class="card" data-action="view-recipe" data-id="${esc(r.id)}" aria-label="${esc(r.title)}">
-    ${visual(r, 'card-img')}${p.length ? `<span class="planned-pill">📅 ${esc(p[0].split(' ')[0])}${p.length > 1 ? ' +' + (p.length - 1) : ''}</span>` : ''}${pf && r.sourcePlatform !== 'web' ? `<span class="src-pill">${pf.icon} ${pf.label}</span>` : ''}</div>
+    ${visual(r, 'card-img')}${p.length ? `<span class="planned-pill">📅 ${esc(p[0].split(' ')[0])}${p.length > 1 ? ' +' + (p.length - 1) : ''}</span>` : ''}${pf && r.sourcePlatform !== 'web' ? `<span class="src-pill">${pf.icon} ${pf.label}</span>` : ''}${needsReview(r) ? '<span class="review-pill">⚠ prüfen</span>' : ''}</div>
     <div class="card-body">
       <h3>${esc(r.title)}</h3>
       <div class="meta"><span>⏱ ${fmtMin(totalMin(r))}</span>${diffHtml(r.difficulty)}</div>
@@ -687,6 +708,16 @@ function modeToggle(){
   const m = state.settings.unitMode;
   return `<span class="mode-toggle" role="group" aria-label="Mengenanzeige"><button data-action="unit-mode" data-mode="original" aria-pressed="${m === 'original'}">Original</button><button data-action="unit-mode" data-mode="metric" aria-pressed="${m === 'metric'}">g / ml</button></span>`;
 }
+function needsReview(r){ return !!(r.review && (r.review.issues.length || r.review.missingSteps || (r.review.confidence != null && r.review.confidence < 70))); }
+function reviewHtml(r){
+  const v = r.review; if (!v) return '';
+  const conf = v.confidence != null ? ` · Sicherheit ${v.confidence} %` : '';
+  const items = [...v.issues, ...(v.notes || [])];
+  if (!needsReview(r)) return `<p class="banner ok" style="margin:10px 0">✅ Automatisch importiert (${esc(v.via)})${conf}. <button class="btn ghost" style="min-height:0;padding:0 4px" data-action="review-ok" data-id="${esc(r.id)}">Ausblenden</button></p>`;
+  return `<div class="banner warn" style="margin:10px 0">⚠ Automatisch importiert (${esc(v.via)})${conf} – bitte kurz prüfen.
+    ${items.length ? `<ul>${items.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+    <div class="btn-row" style="margin-top:8px"><button class="btn secondary" data-action="edit-recipe" data-id="${esc(r.id)}">✏️ Prüfen</button><button class="btn ghost" data-action="review-ok" data-id="${esc(r.id)}">✓ Passt so</button></div></div>`;
+}
 function openDetail(id){
   const r = byId(id); if (!r) return;
   const p = plannedIn(id), metric = state.settings.unitMode === 'metric';
@@ -698,6 +729,7 @@ function openDetail(id){
       ${r.description ? `<p style="margin:0 0 8px">${esc(r.description)}</p>` : ''}
       <div class="badges">${folderBadges(r)}${mealBadges(r)}${(r.tags || []).map(t => `<span class="badge">#${esc(t)}</span>`).join('')}</div>
       ${p.length ? `<p class="planned-note">📅 Geplant: ${esc(p.join(', '))}</p>` : ''}
+      ${reviewHtml(r)}
       <div class="stats">
         <div class="stat">Vorbereitung<b>${fmtMin(r.prepMinutes)}</b></div><div class="stat">Kochen<b>${fmtMin(r.cookMinutes)}</b></div>
         <div class="stat">Portionen<b>${r.servings}</b></div><div class="stat">Niveau<b>${diffHtml(r.difficulty)}</b></div>
@@ -705,6 +737,9 @@ function openDetail(id){
       <h3 class="section-h">🧺 Zutaten ${modeToggle()}</h3>
       <ul class="ing-view" id="ing-view">${ingViewHtml(r)}</ul>
       <h3 class="section-h">👩‍🍳 Zubereitung</h3>
+      ${r.steps.length ? '' : `<div class="fill-box"><p>Die Zubereitung stand nicht in der Beschreibung – meist im angepinnten Kommentar. Kommentar kopieren und hier einfügen:</p>
+        <textarea id="detail-fill" rows="4" placeholder="Zubereitung hier einfügen"></textarea>
+        <div class="btn-row" style="margin-top:8px"><button class="btn secondary" data-action="paste-into" data-target="detail-fill">📋 Einfügen</button><button class="btn primary" data-action="fill-detail" data-id="${esc(r.id)}">✨ Schritte übernehmen</button></div></div>`}
       <ol class="steps-view">${r.steps.map((s, i) => `<li><span class="n">${i + 1}</span><span>${esc(metric ? fToC(s.text) : s.text)}</span></li>`).join('')}</ol>
       ${r.sourceUrl ? `<p>${(PLATFORMS[r.sourcePlatform] || PLATFORMS.web).icon} Quelle: <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener noreferrer">${esc((PLATFORMS[r.sourcePlatform] || PLATFORMS.web).label)} öffnen</a></p>` : ''}
     </div>
@@ -1147,19 +1182,24 @@ async function copyText(text, ta){
 }
 
 /* =========================================================
-   IMPORT
+   IMPORT (über den Rezept-Server)
    ========================================================= */
-// Regex für den iOS-Kurzbefehl „Text abgleichen“ – liefert Beschreibungen aus YouTube-, Instagram- und TikTok-Seiten.
-const SHORTCUT_REGEX = String.raw`"shortDescription":"(?:[^"\\]|\\.)*"|property="og:(?:description|title)" content="[^"]*"|"desc":"(?:[^"\\]|\\.)*"`;
-const SHORTCUT_SEP = '|||';
+const API_DEFAULT = 'https://rezepte-api.maitam-rezepte.workers.dev';
+function apiBase(){ return String(state.settings.apiBase || API_DEFAULT).replace(/\/+$/, ''); }
+async function api(path, body){
+  const res = await fetch(apiBase() + path, body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('Server-Fehler ' + res.status));
+  return data;
+}
 
+// Ältere Kurzbefehle schicken zusätzlich Seitentreffer mit (t=…); die werden hier noch verstanden.
+const SHORTCUT_SEP = '|||';
 function decodeEntities(s){ const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
 function unjson(s){ try { return JSON.parse(s); } catch { return s.slice(1, -1); } }
-/* Aus den Treffern des Kurzbefehls die eigentliche Beschreibung wählen. */
 function pickCaption(raw){
   const chunks = String(raw || '').split(SHORTCUT_SEP).map(c => c.trim()).filter(Boolean);
-  const found = {};
-  let plain = [];
+  const found = {}; const plain = [];
   for (const c of chunks) {
     let m;
     if ((m = c.match(/^"shortDescription":("(?:[^"\\]|\\.)*")$/))) found.yt = found.yt || unjson(m[1]);
@@ -1176,74 +1216,14 @@ function pickCaption(raw){
   return {text:cands.sort((a, b) => b.length - a.length)[0] || '', title:found.title || ''};
 }
 function cleanTitle(t){ return String(t || '').replace(/[^\p{L}\p{N}\s&'’,.:!?()-]/gu, '').replace(/\s{2,}/g, ' ').trim().slice(0, 120); }
-function cleanCaption(t){
-  return String(t).replace(/\r/g, '').split('\n').filter(l => !/^\s*(#\S+\s*)+$/.test(l)).join('\n').trim();
-}
+function cleanCaption(t){ return String(t).replace(/\r/g, '').split('\n').filter(l => !/^\s*(#\S+\s*)+$/.test(l)).join('\n').trim(); }
+function sameLink(a, b){ const n = u => String(u).toLowerCase().replace(/^https?:\/\/(www\.|m\.)?/, '').replace(/[?#].*$/, '').replace(/\/+$/, ''); return n(a) === n(b); }
 
-/* ---------- Gemini ---------- */
-const G_SCHEMA = {
-  type:'OBJECT',
-  properties:{
-    title:{type:'STRING'}, description:{type:'STRING'},
-    servings:{type:'INTEGER', nullable:true}, prepMinutes:{type:'INTEGER', nullable:true}, cookMinutes:{type:'INTEGER', nullable:true},
-    difficulty:{type:'STRING', enum:DIFFS}, mealTypes:{type:'ARRAY', items:{type:'STRING', enum:MEAL_TYPES}}, tags:{type:'ARRAY', items:{type:'STRING'}},
-    ingredients:{type:'ARRAY', items:{type:'OBJECT', properties:{
-      original:{type:'STRING'}, quantity:{type:'NUMBER', nullable:true}, unit:{type:'STRING', enum:UNITS.map(u => u.id)},
-      name:{type:'STRING'}, note:{type:'STRING'}, aisle:{type:'STRING', enum:AISLES.map(a => a.id)},
-      source:{type:'STRING', enum:['text','video','image','guess']}}, required:['original','unit','name','source']}},
-    steps:{type:'ARRAY', items:{type:'STRING'}}, missing:{type:'ARRAY', items:{type:'STRING'}},
-    confidence:{type:'INTEGER'}, bestGuess:{type:'BOOLEAN'}
-  },
-  required:['title','ingredients','steps','confidence']
-};
-const G_PROMPT = `You extract a cooking recipe from a social-media caption, video description or pasted text.
-Rules:
-1. Use ONLY information present in the text. Never invent ingredients, amounts, steps or times.
-2. ingredients[].original must be copied EXACTLY, character for character, from the text — one entry per ingredient. If ingredients are written inline in one paragraph, split them and copy each ingredient's exact substring. Do not translate.
-3. quantity/unit = the primary amount. If two amounts are given (e.g. "60ml (3 tbsp)" or "50g (⅓ cup)"), use the metric one. Fractions as decimals (½ = 0.5). For ranges like "1-2" use the lower value.
-   unit must be one of: pc, g, kg, oz, lb, ml, cl, dl, l, tsp, tbsp, cup, floz, stick, clove, slice, can, pack, becher, pinch, bunch, handful, taste.
-   German: EL/Esslöffel=tbsp, TL/Teelöffel=tsp, Prise/Msp=pinch, Zehe=clove, Bund=bunch, Dose=can, Packung/Päckchen/Pck=pack, Becher=becher, Stück/Stk or no unit=pc, Scheibe=slice, Handvoll=handful.
-   "to taste", "nach Geschmack", "Splash of", or no amount at all: quantity null and unit "taste".
-4. name = ingredient name in the original language, without amount and without preparation notes. note = preparation/extra notes (e.g. "finely chopped", "optional", "plus more to drizzle").
-5. Items listed under "To serve"/"Zum Servieren"/"Topping" are ingredients with note "to serve" (or the text's equivalent).
-6. aisle = supermarket section for the ingredient.
-7. steps = method steps in the original wording and language, one entry per step, without "Step 1:" prefixes or numbering. If the method is NOT in the text (e.g. "method in the comments"), return [] and put "steps" into missing.
-8. Ignore ads, sponsor mentions, prices, hashtags, emojis-only lines and calls to action.
-9. title = dish name in Title Case without emojis. description = one short sentence from the text or "".
-10. servings from "serves 4"/"für 4 Personen"/"4 Portionen", else null. prepMinutes/cookMinutes only if stated, else null.
-11. mealTypes and difficulty: your best judgement. tags: up to 4 short lowercase tags in the text's language.
-12. ingredients[].source: "text" if it comes from the given TEXT, "video" if only shown or spoken in an attached video, "image" if read from an attached image, "guess" if estimated.
-13. If a video is attached: watch it, listen to the narration and read on-screen text. Merge it with the TEXT; the TEXT wins on conflicts. For items only in the video, original = the wording as spoken or shown.
-14. confidence: 0-100, how sure you are that ingredients and steps are complete and correct.
-15. bestGuess: false, unless stated otherwise below.`;
-const G_IMAGE_PROMPT = `The attached image(s) show a recipe: screenshot, cookbook page, handwritten card or photo carousel slides (in order).
-Read all text in the images. original = the line exactly as written in the image. source = "image".
-If the images show only a finished dish and no recipe text, identify the dish and write a realistic best-guess recipe: bestGuess true, source "guess", confidence at most 40.`;
-function youtubeWatchUrl(url){
-  const m = String(url || '').match(/(?:youtu\.be\/|v=|shorts\/|embed\/)([\w-]{11})/);
-  return m ? `https://www.youtube.com/watch?v=${m[1]}` : '';
-}
-
-async function geminiCall(prompt, mediaParts = []){
-  const s = state.settings;
-  if (!s.geminiKey) throw new Error('NO_KEY');
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(s.model || 'gemini-flash-latest')}:generateContent`, {
-    method:'POST',
-    headers:{'Content-Type':'application/json', 'x-goog-api-key':s.geminiKey},
-    body:JSON.stringify({contents:[{role:'user', parts:[...mediaParts, {text:prompt}]}],
-      generationConfig:{responseMimeType:'application/json', responseSchema:G_SCHEMA, temperature:0}})
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
-  const txt = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts.map(p => p.text || '').join('');
-  if (!txt) throw new Error('Leere Antwort von Gemini');
-  return JSON.parse(txt);
-}
 const normWs = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
-function draftFromGemini(g, sourceText, url){
+function draftFromAI(g, sourceText, url, aiLabel, mode){
   const d = blankDraft(), flags = new Set(), report = [];
-  const src = normWs(sourceText);
-  d.title = String(g.title || '').slice(0, 120);
+  const src = normWs(sourceText || '');
+  d.title = cleanTitle(g.title);
   d.description = String(g.description || '').slice(0, 1000);
   if (g.servings > 0) d.servings = Math.min(g.servings, 100); else flags.add('servings');
   if (g.prepMinutes != null) d.prepMinutes = g.prepMinutes; else flags.add('prepMinutes');
@@ -1251,32 +1231,27 @@ function draftFromGemini(g, sourceText, url){
   d.difficulty = DIFFS.includes(g.difficulty) ? g.difficulty : 'easy';
   d.mealTypes = (g.mealTypes || []).filter(m => MEAL_TYPES.includes(m));
   d.tags = (g.tags || []).map(t => String(t).toLowerCase().slice(0, 30)).slice(0, 4);
-  let notVerbatim = 0, noQty = 0;
+  let notVerbatim = 0;
   d.ingredients = (g.ingredients || []).map(x => {
     const i = {id:uid(), original:String(x.original || '').trim(), quantity:typeof x.quantity === 'number' && x.quantity > 0 ? x.quantity : null,
       unit:UNIT[x.unit] ? x.unit : 'pc', name:String(x.name || '').trim().slice(0, 80), note:String(x.note || '').trim().slice(0, 120), aisle:AISLE[x.aisle] ? x.aisle : guessAisle(x.name)};
     if (i.quantity == null && i.unit !== 'taste') i.unit = 'taste';
     const from = x.source || 'text';
     if (from === 'video') i._why = '🎬 Aus dem Video (gesprochen oder eingeblendet)';
-    else if (from === 'image') {}
     else if (from === 'guess') { i._flag = true; i._why = '⚠ Geschätzt – bitte prüfen.'; }
-    else if (i.original && !src.includes(normWs(i.original))) { i._flag = true; i._why = '⚠ Steht so nicht wörtlich im Text – bitte vergleichen.'; notVerbatim++; }
+    else if (from === 'text' && src && i.original && !src.includes(normWs(i.original))) { i._flag = true; i._why = '⚠ Steht so nicht wörtlich im Text – bitte vergleichen.'; notVerbatim++; }
     if (!i.name) { i._flag = true; i._why = '⚠ Name fehlt.'; }
-    if (i.unit === 'taste') noQty++;
     return i;
   });
   d.steps = (g.steps || []).map(t => ({id:uid(), text:String(t).trim().slice(0, 2000)})).filter(s => s.text);
   if (!d.title) flags.add('title');
   if (!d.ingredients.length) flags.add('ingredients');
   if (!d.steps.length) flags.add('steps');
-  flags.add('mealTypes');
   d._confidence = Math.max(0, Math.min(100, +g.confidence || 0));
   d._bestGuess = !!g.bestGuess;
-  report.push({ok:true, label:'Gelesen mit', detail:'Gemini (' + (state.settings.model || 'gemini-flash-latest') + ')' + (g._mode ? ' · ' + g._mode : '')});
-  report.push({ok:d._confidence >= 70, label:'Sicherheit', detail:`${d._confidence} %${d._bestGuess ? ' · geschätztes Rezept nach Foto' : ''}`});
-  report.push({ok:!!d.title, label:'Titel', detail:d.title || 'nicht gefunden'});
-  report.push({ok:d.ingredients.length > 0 && !notVerbatim, label:'Zutaten', detail:`${d.ingredients.length} erkannt${notVerbatim ? ` · ${notVerbatim} nicht wörtlich gefunden` : ' · alle wörtlich im Text gefunden'}${noQty ? ` · ${noQty} ohne Menge` : ''}`});
-  report.push({ok:d.steps.length > 0, label:'Zubereitung', detail:d.steps.length ? `${d.steps.length} Schritte` : 'fehlt – steht wohl im Kommentar'});
+  report.push({ok:true, label:'Gelesen mit', detail:`${aiLabel}${mode ? ' · ' + mode : ''}`});
+  report.push({ok:d._confidence >= 70, label:'Sicherheit', detail:`${d._confidence} %`});
+  report.push({ok:!notVerbatim, label:'Zutaten', detail:`${d.ingredients.length} erkannt${notVerbatim ? ` · ${notVerbatim} nicht wörtlich gefunden` : ''}`});
   return finishDraft(d, flags, report, url);
 }
 function finishDraft(d, flags, report, url){
@@ -1285,17 +1260,16 @@ function finishDraft(d, flags, report, url){
   const social = state.folders.find(f => /social/i.test(f.name));
   d.folderIds = state.settings.lastFolderIds.filter(folderById);
   if (!d.folderIds.length && social && d.sourcePlatform && d.sourcePlatform !== 'web') d.folderIds = [social.id];
-  if (!d.ingredients.length) d.ingredients = [{_flag:true}];
   return {draft:d, flags, report};
 }
 function guessEmoji(t){
   const s = String(t).toLowerCase();
-  const map = [[/pumpkin|kürbis/,'🎃'],[/gnocchi|pasta|spaghetti|nudel|penne/,'🍝'],[/soup|suppe|stew|eintopf/,'🍲'],[/salad|salat/,'🥗'],[/curry/,'🍛'],[/taco/,'🌮'],[/pizza/,'🍕'],[/shrimp|garnele|prawn/,'🍤'],[/fish|lachs|salmon|fisch/,'🐟'],[/chicken|hähnchen|huhn/,'🍗'],[/beef|rind|steak|rib/,'🥩'],[/noodle|ramen|udon/,'🍜'],[/pancake|pfannkuchen/,'🥞'],[/cake|kuchen|muffin|brownie/,'🧁'],[/oat|porridge|granola/,'🥣'],[/egg|omelet|ei/,'🍳'],[/wrap|burrito/,'🌯'],[/dumpling|gyoza|maultasche/,'🥟'],[/sandwich|toast/,'🥪']];
+  const map = [[/pumpkin|kürbis/,'🎃'],[/gnocchi|pasta|spaghetti|nudel|penne/,'🍝'],[/soup|suppe|stew|eintopf/,'🍲'],[/salad|salat/,'🥗'],[/curry/,'🍛'],[/taco/,'🌮'],[/pizza/,'🍕'],[/shrimp|garnele|prawn/,'🍤'],[/fish|lachs|salmon|fisch/,'🐟'],[/chicken|hähnchen|huhn/,'🍗'],[/beef|rind|steak|rib/,'🥩'],[/noodle|ramen|udon/,'🍜'],[/pancake|pfannkuchen/,'🥞'],[/cake|kuchen|muffin|brownie/,'🧁'],[/oat|porridge|granola/,'🥣'],[/egg|omelet/,'🍳'],[/wrap|burrito/,'🌯'],[/dumpling|gyoza|maultasche/,'🥟'],[/sandwich|toast/,'🥪']];
   for (const [re, e] of map) if (re.test(s)) return e;
   return '🍽️';
 }
 
-/* ---------- Einfacher Parser (ohne Gemini) ---------- */
+/* ---------- Einfacher Parser (wenn keine KI erreichbar ist) ---------- */
 const QTY_RE = /^(\d+(?:[.,]\d+)?\s+\d+\/\d+|\d+\/\d+|\d+(?:[.,]\d+)?\s*[½⅓⅔¼¾⅛⅜⅝⅞]|\d+(?:[.,]\d+)?|[½⅓⅔¼¾⅛⅜⅝⅞])(?:\s*(?:-|–|to|bis)\s*(?:\d+(?:[.,]\d+)?(?:\/\d+)?|[½⅓⅔¼¾⅛]))?/i;
 function parseIngredientLine(raw){
   const original = String(raw).replace(/^[-*•▢□✓·▪◦]+\s*/, '').trim();
@@ -1337,10 +1311,9 @@ function guessMeals(text){
   for (const [meal, words] of Object.entries(K)) if (words.some(w => t.includes(w))) out.push(meal);
   return out;
 }
-/* Rezepte in einem einzigen Absatz (typisch TikTok) in Zeilen zerlegen. */
 function splitInline(text){
   if (text.split('\n').filter(l => l.trim()).length > 4) return text;
-  let t = text.replace(/\s+(?=(ingredients?|zutaten|method|instructions?|directions?|zubereitung)\b)/gi, '\n')
+  const t = text.replace(/\s+(?=(ingredients?|zutaten|method|instructions?|directions?|zubereitung)\b)/gi, '\n')
               .replace(/\b(ingredients?|zutaten|method|instructions?|directions?|zubereitung)\b\s*:?\s*/gi, '$1\n')
               .replace(/\s+(?=(step|schritt)\s*\d+\s*:)/gi, '\n');
   return t.split('\n').map(seg => /^(step|schritt)\s*\d|^(method|instructions?|directions?|zubereitung)$/i.test(seg.trim()) ? seg
@@ -1358,10 +1331,15 @@ function localParse(text, url, titleHint){
     if (!l) continue;
     const bare = l.replace(/[^\p{L}\s'’]/gu, '').trim();
     if (ING_H.test(bare) || /^(ingredients?|zutaten)\b/i.test(bare) && bare.length < 40) { section = 'ing'; const sm = l.match(/(?:serves|für)\s*(\d+)/i); if (sm) d.servings = +sm[1]; continue; }
-    if (STEP_H.test(bare) || /^(method|zubereitung|instructions?)\b/i.test(bare) && bare.length < 40) { section = 'steps'; if (/comment|kommentar/i.test(l)) d._stepsInComments = true; continue; }
+    if (STEP_H.test(bare) || /^(method|zubereitung|instructions?)\b/i.test(bare) && bare.length < 40) { section = 'steps'; continue; }
     if (OTHER_H.test(bare)) { section = 'other'; continue; }
-    if (/^\s*(#\S+\s*)+$/.test(l)) continue;
     if (section === 'head') head.push(l); else if (section === 'ing') ingL.push(l); else if (section === 'steps') stepL.push(l);
+  }
+  if (!ingL.length) { // keine Überschrift „Zutaten“: Zeilen mit Mengenangabe sind Zutaten
+    for (let i = head.length - 1; i > 0; i--) {
+      const l = head[i];
+      if ((QTY_RE.test(l.replace(/^[-*•]\s*/, '')) || /^[-*•]/.test(l)) && !/\b(serves|servings?|portionen|prep|cook|min)\b/i.test(l)) ingL.unshift(...head.splice(i, 1));
+    }
   }
   for (const l of head) {
     let m;
@@ -1370,110 +1348,167 @@ function localParse(text, url, titleHint){
     if ((m = l.match(/\b(?:cook|koch|back)\w*\s*:?\s*([^|;,]+)/i)) && minutesIn(m[1]) != null) d.cookMinutes = minutesIn(m[1]);
   }
   d.title = cleanTitle(titleHint) || cleanTitle(head.find(l => !PROMO.test(l)) || '');
-  if (d.title === d.title.toUpperCase()) d.title = d.title.toLowerCase().replace(/(^|\s)\p{L}/gu, c => c.toUpperCase());
+  if (d.title && d.title === d.title.toUpperCase()) d.title = d.title.toLowerCase().replace(/(^|\s)\p{L}/gu, c => c.toUpperCase());
   d.ingredients = ingL.filter(l => !/^(to serve|zum servieren)\s*:/i.test(l)).map(parseIngredientLine);
   d.steps = stepL.map(l => ({id:uid(), text:l.replace(/^(step|schritt)\s*\d+\s*[.):-]?\s*/i, '').replace(/^\d+\s*[.):-]\s*/, '').replace(/^[-*•]\s*/, '').slice(0, 2000)})).filter(s => s.text && !/👇\s*$/.test(s.text));
   d.mealTypes = guessMeals(d.title);
-  if (!d.title) flags.add('title');
-  if (!/serves|portionen|für\s*\d/i.test(text)) flags.add('servings');
-  if (d.prepMinutes === '') flags.add('prepMinutes');
-  if (d.cookMinutes === '') flags.add('cookMinutes');
-  if (!d.ingredients.length) flags.add('ingredients');
   if (!d.steps.length) flags.add('steps');
-  flags.add('difficulty'); flags.add('mealTypes');
-  const bad = d.ingredients.filter(i => i._flag).length;
-  report.push({ok:false, label:'Gelesen mit', detail:'Einfachem Parser (kein Gemini-Schlüssel). Ergebnis bitte prüfen.'});
-  report.push({ok:!!d.title, label:'Titel', detail:d.title || 'nicht gefunden'});
-  report.push({ok:d.ingredients.length > 0 && !bad, label:'Zutaten', detail:`${d.ingredients.length} erkannt${bad ? ` · ${bad} unsicher` : ''}`});
-  report.push({ok:d.steps.length > 0, label:'Zubereitung', detail:d.steps.length ? `${d.steps.length} Schritte` : 'fehlt'});
+  report.push({ok:false, label:'Gelesen mit', detail:'einfachem Parser (KI nicht erreichbar)'});
   return finishDraft(d, flags, report, url);
 }
 
-async function importText(text, url, titleHint){
-  const caption = cleanCaption(text);
-  if (!caption && !url) { toast('Füge zuerst einen Link oder Rezepttext ein.'); return; }
-  if (!caption && !(state.settings.geminiKey && youtubeWatchUrl(url))) { // nur Link, kein Text
-    ui.view = 'import'; ui.importUrl = url; render();
-    toast('Beschreibung konnte nicht geladen werden – bitte Text einfügen.');
-    return;
-  }
-  let res, err = '';
-  const yt = state.settings.analyzeVideo !== false ? youtubeWatchUrl(url) : '';
-  if (state.settings.geminiKey) {
-    const spin = openModal({cls:'small', html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>Rezept wird gelesen…</strong><br><span class="lead">${yt ? 'Gemini schaut das Video an, hört zu und liest die Beschreibung. Das dauert bis zu einer Minute.' : 'Gemini sortiert Zutaten und Schritte.'}</span></p></div>`});
-    const prompt = `${G_PROMPT}\n\nSOURCE URL: ${url || '-'}\nVIDEO TITLE: ${titleHint || '-'}\n\nTEXT:\n${caption || '(no text – use the video)'}`;
-    if (yt) {
-      try { const g = await geminiCall(prompt, [{file_data:{file_uri:yt}}]); g._mode = 'Video + Ton + Beschreibung'; res = draftFromGemini(g, caption, url); }
-      catch (e) { err = 'Video konnte nicht ausgewertet werden (' + e.message + '), nur Beschreibung gelesen.'; }
-    }
-    if (!res && caption) {
-      try { const g = await geminiCall(prompt); g._mode = 'Beschreibung'; res = draftFromGemini(g, caption, url); if (yt) res.report.push({ok:false, label:'Video', detail:err}); err = ''; }
-      catch (e) { err = e.message === 'NO_KEY' ? '' : e.message; }
-    }
-    if (modalStack.length && modalStack[modalStack.length - 1].wrap.contains(spin)) closeModal();
-  }
-  if (!res && !caption) { ui.view = 'import'; ui.importUrl = url; render(); toast('⚠ ' + (err || 'Keine Beschreibung gefunden.')); return; }
-  if (!res) res = localParse(caption, url, titleHint);
-  showImportResult(res, err);
-}
-function showImportResult(res, err){
-  ui.lastReport = {title:res.draft.title, items:res.report, error:err};
-  if (ui.view === 'import') render();
-  const missingSteps = res.flags.has('steps');
-  const n = res.draft.ingredients.filter(i => i._flag).length;
-  const viaGemini = res.draft._confidence != null;
-  const msg = [`📥 Importiert${viaGemini ? ` mit Gemini · Sicherheit ${res.draft._confidence} %` : ''}.`];
-  if (res.draft._bestGuess) msg.push('<strong>Geschätztes Rezept</strong> – nur nach dem Foto, kein Originaltext.');
-  if (err) msg.push(`Gemini-Fehler: ${esc(err)} – einfacher Parser benutzt.`);
-  if (n) msg.push(`<strong>${n} Zutat${n > 1 ? 'en' : ''}</strong> bitte prüfen.`);
-  if (missingSteps) msg.push('<strong>Zubereitung fehlt</strong> – unten aus dem Kommentar einfügen.');
-  if (!n && !missingSteps && !err) msg.push('Alles erkannt – kurz prüfen und speichern.');
-  const warn = n || missingSteps || err || res.draft._bestGuess || (viaGemini && res.draft._confidence < 70);
-  openForm(res.draft, {flags:[...res.flags].filter(f => !(viaGemini && f === 'difficulty')), banner:msg.join(' '), bannerType:warn ? 'warn' : 'ok'});
-}
-
-/* ---------- Fotos & Screenshots ---------- */
-function shrinkImage(file, max = 1600){
+/* ---------- Ablauf: Link → Server → automatisch speichern ---------- */
+function shrinkImage(blob, max = 1600, quality = 0.85){
   return new Promise((resolve, reject) => {
-    const img = new Image(), url = URL.createObjectURL(file);
+    const img = new Image(), url = URL.createObjectURL(blob);
     img.onload = () => {
       const k = Math.min(1, max / Math.max(img.width, img.height));
       const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
       c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
       URL.revokeObjectURL(url);
-      resolve(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+      resolve(c.toDataURL('image/jpeg', quality).split(',')[1]);
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Bild konnte nicht gelesen werden')); };
     img.src = url;
   });
 }
-async function importImages(files){
+async function fetchImageData(url){
+  if (!url) return '';
+  try {
+    const res = await fetch(apiBase() + '/img?u=' + encodeURIComponent(url));
+    if (!res.ok) return '';
+    return 'data:image/jpeg;base64,' + await shrinkImage(await res.blob(), 900, 0.8);
+  } catch { return ''; }
+}
+function progressSheet(title){
+  const dlg = openModal({cls:'small', sticky:true, html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>${esc(title)}</strong><br><span class="lead" id="prog-step"></span></p></div>`});
+  return {
+    step: t => { const el = dlg.querySelector('#prog-step'); if (el) el.textContent = t; },
+    close: () => { if (modalStack.length && modalStack[modalStack.length - 1].wrap.contains(dlg)) closeModal(); }
+  };
+}
+async function importFromServer({link = '', text = '', images = []}){
+  link = (String(link).match(/https?:\/\/\S+/) || [''])[0];
+  if (link) {
+    const dup = state.recipes.find(r => r.sourceUrl && sameLink(r.sourceUrl, link));
+    if (dup && !text && !images.length) { toast('Dieses Rezept ist schon gespeichert.'); openDetail(dup.id); return; }
+  }
+  const video = state.settings.analyzeVideo !== false;
+  const p = progressSheet(images.length ? 'Fotos werden gelesen…' : 'Rezept wird geladen…');
+  p.step(link ? 'Beitrag wird abgerufen' : 'Text wird ausgewertet');
+  const later = setTimeout(() => p.step(platformOf(link) === 'youtube' && video ? 'KI schaut das Video an und hört zu… (bis zu 1 Minute)' : 'KI erkennt Zutaten und Schritte…'), 1500);
+  let data;
+  try { data = await api('/extract', {link, text, images, video}); }
+  catch (e) {
+    clearTimeout(later); p.close();
+    if (text) { autoSave(localParse(cleanCaption(text), link, ''), {}); return; }
+    importFailed(link, 'Rezept-Server nicht erreichbar (' + e.message + ').'); return;
+  }
+  clearTimeout(later);
+  let res;
+  if (data.recipe) res = draftFromAI(data.recipe, data.caption || text, link, data.ai === 'gemini' ? 'Gemini' : 'Cloudflare-KI', data.aiMode);
+  else if (data.caption || text) res = localParse(cleanCaption(data.caption || text), link, data.title);
+  else { p.close(); importFailed(link, data.aiError || 'Keine Rezeptangaben gefunden.'); return; }
+  if (!res.draft.title && data.title) res.draft.title = cleanTitle(data.title);
+  if (data.aiError) res.report.push({ok:false, label:'Hinweis', detail:data.aiError});
+  if (data.imageUrl) { p.step('Bild wird gespeichert…'); res.draft.image = await fetchImageData(data.imageUrl); }
+  p.close();
+  autoSave(res, data);
+}
+function autoSave(res){
+  const d = res.draft, now = new Date().toISOString();
+  const ingredients = d.ingredients.filter(i => i.name).map(({_flag, _why, ...i}) => ({...i, id:i.id || uid(), original:i.original || composeLine(i), aisle:i.aisle || guessAisle(i.name)}));
+  const steps = d.steps.filter(s => s.text).map(s => ({id:s.id || uid(), text:s.text}));
+  const flagged = d.ingredients.filter(i => i._flag).map(i => i.original || i.name).filter(Boolean);
+  const issues = [];
+  if (d._bestGuess) issues.push('Geschätztes Rezept – nur nach dem Foto.');
+  if (flagged.length) issues.push(`${flagged.length} Zutat${flagged.length > 1 ? 'en' : ''} prüfen: ${flagged.slice(0, 3).join(', ')}${flagged.length > 3 ? ' …' : ''}`);
+  if (!ingredients.length) issues.push('Keine Zutaten erkannt.');
+  const rec = {id:uid(), title:d.title || 'Neues Rezept', description:d.description || '', emoji:d.emoji || '🍽️', image:d.image || '',
+    servings:+d.servings > 0 ? +d.servings : 2, prepMinutes:+d.prepMinutes || 0, cookMinutes:+d.cookMinutes || 0,
+    difficulty:DIFFS.includes(d.difficulty) ? d.difficulty : 'easy', mealTypes:d.mealTypes || [], tags:d.tags || [], folderIds:d.folderIds || [],
+    ingredients, steps, sourceUrl:d.sourceUrl || '', sourcePlatform:d.sourcePlatform || '', createdAt:now, updatedAt:now,
+    review:{confidence:d._confidence ?? null, via:(res.report[0] || {}).detail || '', notes:res.report.filter(r => r.label === 'Hinweis').map(r => r.detail), issues, missingSteps:!steps.length}};
+  state.recipes.push(rec);
+  save(); ui.view = 'library'; ui.folder = 'all'; render(); window.scrollTo(0, 0);
+  openDetail(rec.id);
+  toast(issues.length || !steps.length ? '✅ Gespeichert – bitte kurz prüfen' : '✅ Rezept gespeichert');
+}
+function importFailed(link, msg){
+  const dlg = openModal({html:`
+    <div class="sheet-head"><button class="icon-btn" data-action="close-modal" aria-label="Schließen">✕</button><h2>Nicht automatisch lesbar</h2><span style="width:48px"></span></div>
+    <form class="sheet-body" id="fail-form" novalidate>
+      <p class="banner warn">${esc(msg)}</p>
+      ${link ? `<p>Öffne den Beitrag, kopiere die Beschreibung (oder mach Screenshots) und füg sie hier ein – der Rest läuft automatisch.</p>` : ''}
+      <textarea id="fail-text" rows="8" placeholder="Beschreibung hier einfügen"></textarea>
+      <div class="btn-row" style="margin-top:10px"><button type="button" class="btn secondary" data-action="paste-into" data-target="fail-text">📋 Einfügen</button>
+        <button type="submit" class="btn primary" style="flex:1">✨ Rezept erkennen</button></div>
+      <div class="btn-row" style="margin-top:10px"><label class="btn secondary" style="flex:1;cursor:pointer">📷 Screenshots wählen<input type="file" id="img-file" data-link="${esc(link)}" accept="image/*" multiple hidden></label></div>
+    </form>`});
+  dlg.querySelector('#fail-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const text = dlg.querySelector('#fail-text').value.trim();
+    if (!text) { toast('Erst den Text einfügen.'); return; }
+    closeModal(); importFromServer({link, text});
+  });
+}
+function openAddSheet(prefill = ''){
+  const dlg = openModal({html:`
+    <div class="sheet-head"><button class="icon-btn" data-action="close-modal" aria-label="Schließen">✕</button><h2>＋ Rezept hinzufügen</h2><span style="width:48px"></span></div>
+    <form class="sheet-body" id="add-form" novalidate>
+      <label class="flabel" for="add-link">Link von Instagram, TikTok, YouTube oder einer Rezeptseite</label>
+      <div class="key-row"><input id="add-link" type="url" inputmode="url" placeholder="https://…" value="${esc(prefill)}" autocomplete="off" autofocus>
+        <button type="button" class="icon-btn" data-action="paste-link" aria-label="Link aus Zwischenablage einfügen">📋</button></div>
+      <button type="submit" class="btn primary block" style="margin-top:12px;min-height:56px;font-size:18px">✨ Rezept importieren</button>
+      <p class="lead" style="font-size:15px;margin:10px 0 0">Bild, Zutaten, Schritte und Angaben werden automatisch übernommen.</p>
+      <div class="btn-row" style="margin-top:18px">
+        <label class="btn secondary" style="flex:1;cursor:pointer">📷 Aus Fotos<input type="file" id="img-file" accept="image/*" multiple hidden></label>
+        <button type="button" class="btn secondary" style="flex:1" data-action="manual-recipe">✏️ Selbst schreiben</button>
+      </div>
+    </form>`});
+  dlg.querySelector('#add-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const v = dlg.querySelector('#add-link').value.trim();
+    if (!/https?:\/\//.test(v)) { toast('Bitte einen Link einfügen.'); return; }
+    closeModal(); importFromServer({link:v});
+  });
+}
+async function importImages(files, link = ''){
   const list = [...files].filter(f => f.type.startsWith('image/')).slice(0, 10);
   if (!list.length) return;
-  if (!state.settings.geminiKey) { toast('Für Fotos wird der Gemini-Schlüssel gebraucht (⚙️ Mehr).'); return; }
-  const spin = openModal({cls:'small', html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>${list.length} Bild${list.length > 1 ? 'er werden' : ' wird'} gelesen…</strong></p></div>`});
-  let res, err = '';
+  while (modalStack.length) closeModal();
   try {
-    const parts = [];
-    for (const f of list) parts.push({inline_data:{mime_type:'image/jpeg', data:await shrinkImage(f)}});
-    const g = await geminiCall(`${G_PROMPT}\n\n${G_IMAGE_PROMPT}\n\nTEXT:\n${ui.importText.trim() || '(none – use the images)'}`, parts);
-    g._mode = `${list.length} Bild${list.length > 1 ? 'er' : ''}`;
-    res = draftFromGemini(g, ui.importText, ui.importUrl.trim());
-  } catch (e) { err = e.message; }
-  if (modalStack.length && modalStack[modalStack.length - 1].wrap.contains(spin)) closeModal();
-  if (!res) { toast('⚠ ' + err); return; }
-  showImportResult(res, '');
+    const images = [];
+    for (const f of list) images.push(await shrinkImage(f, 1600, 0.85));
+    const cover = 'data:image/jpeg;base64,' + await shrinkImage(list[0], 900, 0.8);
+    const before = state.recipes.length;
+    await importFromServer({link, images});
+    const rec = state.recipes.length > before ? state.recipes[state.recipes.length - 1] : null;
+    if (rec && !rec.image && !link) { rec.image = cover; save(); refreshDetail(); }
+  } catch (e) { toast('⚠ ' + e.message); }
 }
-
+async function stepsFromText(text){
+  try { const data = await api('/extract', {text}); if (data.recipe && data.recipe.steps && data.recipe.steps.length) return data.recipe.steps; } catch {}
+  return text.split(/\n+|(?=\b(?:step|schritt)\s*\d+)/i).map(l => l.replace(/^(step|schritt)\s*\d+\s*[.):-]?\s*/i, '').replace(/^\d+\s*[.):-]\s*/, '').trim())
+    .filter(l => l.length > 3 && !/^(method|instructions?|directions?|zubereitung|anleitung|steps?)\b[^\p{L}]*$/iu.test(l));
+}
+async function fillStepsInDetail(id){
+  const r = byId(id), ta = document.getElementById('detail-fill');
+  const text = ta ? ta.value.trim() : '';
+  if (!r || !text) { toast('Erst den Kommentar einfügen.'); return; }
+  const p = progressSheet('Schritte werden erkannt…');
+  const steps = await stepsFromText(text);
+  p.close();
+  if (!steps.length) { toast('Keine Schritte gefunden.'); return; }
+  r.steps = steps.map(t => ({id:uid(), text:String(t).slice(0, 2000)}));
+  if (r.review) r.review.missingSteps = false;
+  save(); refreshDetail(); render();
+  toast(`✅ ${steps.length} Schritte ergänzt`);
+}
 async function applyFill(form){
   const ta = form.querySelector('#fill-text'), text = ta.value.trim();
   if (!text) { toast('Erst den Text einfügen.'); ta.focus(); return; }
-  let steps = [];
-  if (state.settings.geminiKey) {
-    try { const g = await geminiCall(`${G_PROMPT}\n\nThe text below is the method part of a recipe (e.g. a pinned comment). Return its steps; ingredients may be empty.\n\nTEXT:\n${text}`); steps = g.steps || []; }
-    catch (e) { toast('Gemini-Fehler: ' + e.message); }
-  }
-  if (!steps.length) steps = text.split(/\n+|(?=\b(?:step|schritt)\s*\d+)/i).map(l => l.replace(/^(step|schritt)\s*\d+\s*[.):-]?\s*/i, '').replace(/^\d+\s*[.):-]\s*/, '').trim()).filter(l => l.length > 3 && !/^(method|instructions?|directions?|zubereitung|anleitung|steps?)\b[^\p{L}]*$/iu.test(l));
+  const steps = await stepsFromText(text);
   const list = form.querySelector('#step-list');
   [...list.children].forEach(li => { if (!li.querySelector('.s-text').value.trim()) li.remove(); });
   steps.forEach(t => list.appendChild(stepRowEl({text:t})));
@@ -1483,93 +1518,56 @@ async function applyFill(form){
   toast(`✅ ${steps.length} Schritte übernommen`);
 }
 
-/* Aufruf durch den Kurzbefehl: …/#import?u=<Link>&t=<Treffer> */
+/* Aufruf durch den Kurzbefehl: …/#import?u=<Link> */
 function handleIncoming(){
   const h = location.hash;
   if (!h.startsWith('#import')) return;
   const params = new URLSearchParams(h.slice(h.indexOf('?') + 1));
   const url = (params.get('u') || '').trim(), raw = params.get('t') || '';
   history.replaceState(null, '', location.pathname + location.search);
-  const {text, title} = pickCaption(raw);
-  ui.importUrl = url; ui.importText = text;
-  importText(text, url, title);
-}
-
-function viewImport(){
-  const rep = ui.lastReport;
-  return `
-  <div class="page-title"><h2>📥 Rezept importieren</h2></div>
-  <p class="lead">Am schnellsten: in Instagram, TikTok oder YouTube auf <strong>Teilen → Rezept speichern</strong> tippen (Einrichtung unter ⚙️ Mehr). Oder hier Beschreibung einfügen.</p>
-  <div class="two-col">
-    <div>
-      <div class="field"><label for="imp-url">Link <span class="opt">(optional)</span></label><input id="imp-url" type="url" inputmode="url" value="${esc(ui.importUrl)}" placeholder="https://www.instagram.com/reel/…"></div>
-      <div class="field"><label for="imp">Beschreibung / Rezepttext</label>
-        <textarea id="imp" rows="12" placeholder="Caption oder Videobeschreibung hier einfügen">${esc(ui.importText)}</textarea></div>
-      <div class="btn-row">
-        <button class="btn primary" data-action="import-parse">✨ Rezept erkennen</button>
-        <button class="btn secondary" data-action="paste-import">📋 Aus Zwischenablage</button>
-        <label class="btn secondary" style="cursor:pointer">📷 Fotos / Screenshots<input type="file" id="img-file" accept="image/*" multiple hidden></label>
-      </div>
-      <p class="lead" style="font-size:15px;margin-top:10px">Fotos: Kochbuchseite, handgeschriebene Karte, Screenshots einer Instagram-Slideshow (bis 10, in Reihenfolge) – oder nur ein Foto vom Gericht, dann schätzt Gemini ein Rezept.</p>
-      ${state.settings.geminiKey ? '' : `<p class="banner warn" style="margin-top:14px">Ohne Gemini-Schlüssel läuft nur der einfache Parser. Schlüssel unter <button class="btn ghost" data-action="nav" data-view="settings" style="min-height:0;padding:0 4px">⚙️ Mehr</button> eintragen.</p>`}
-    </div>
-    <aside class="panel">
-      ${rep ? `<h3>Letzter Import: ${esc(rep.title || 'ohne Titel')}</h3>${rep.error ? `<p class="banner error">Gemini-Fehler: ${esc(rep.error)}</p>` : ''}<ul class="report">${rep.items.map(i => `<li><span class="ic" aria-hidden="true">${i.ok ? '✅' : '⚠️'}</span><span><strong>${esc(i.label)}</strong><br>${esc(i.detail)}</span></li>`).join('')}</ul>`
-            : `<h3>So klappt's am besten</h3><ul class="hint-list">
-                <li>Die Zutaten werden <strong>1:1 als Originalzeile</strong> gespeichert. Beim Ansehen kannst du auf <strong>g / ml</strong> umschalten.</li>
-                <li>Steht die Zubereitung im angepinnten Kommentar: Kommentar kopieren und im Formular unter „Zubereitung“ einfügen.</li>
-                <li>Mit Gemini werden auch Rezepte in einem einzigen Absatz (typisch TikTok) sauber getrennt.</li>
-                <li>Bei <strong>YouTube</strong> schaut Gemini zusätzlich das Video an: gesprochene Mengen und eingeblendete Texte werden mit ausgewertet (🎬 markiert).</li></ul>`}
-    </aside>
-  </div>`;
+  while (modalStack.length) closeModal();
+  importFromServer({link:url, text:raw ? pickCaption(raw).text : ''});
 }
 
 /* =========================================================
-   MEHR: Einstellungen, Kurzbefehl, Backup, Datenmodell
+   MEHR: Server, Kurzbefehl, Backup, Datenmodell
    ========================================================= */
 function appUrl(){ return location.origin + location.pathname; }
+let serverStatus = null;
+async function checkServer(){
+  try { serverStatus = await api('/health'); } catch (e) { serverStatus = {ok:false, error:e.message}; }
+  if (ui.view === 'settings') render();
+}
 function viewSettings(){
   const s = state.settings;
-  const template = `${appUrl()}#import?u=[Link]&t=[Text]`;
+  if (serverStatus === null) { serverStatus = 'loading'; checkServer(); }
+  const st = serverStatus;
+  const stHtml = st === 'loading' ? '<span class="status-dot">● wird geprüft…</span>'
+    : st && st.ok ? `<span class="status-dot ok">● verbunden</span> · KI: ${st.ai === 'gemini' ? 'Gemini (mit Video- und Fotoanalyse)' : st.ai === 'workers-ai' ? 'Cloudflare-KI (Text)' : 'keine'}`
+    : `<span class="status-dot no">● nicht erreichbar</span>${st && st.error ? ' – ' + esc(st.error) : ''}`;
   return `
   <div class="page-title"><h2>⚙️ Mehr</h2></div>
   <div class="two-col">
   <div>
     <section class="panel">
-      <h3>🤖 Gemini (kostenlos)</h3>
-      <p>Status: ${s.geminiKey ? '<span class="status-dot ok">● Schlüssel gespeichert</span>' : '<span class="status-dot no">● kein Schlüssel</span>'}</p>
-      <ol class="hint-list">
-        <li>In Safari <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a> öffnen und mit Google anmelden.</li>
-        <li>„API-Schlüssel erstellen“ tippen und den Schlüssel kopieren.</li>
-        <li>Hier einfügen und „Speichern“ tippen. Er bleibt nur auf diesem Gerät.</li>
-      </ol>
-      <div class="field"><label for="g-key">API-Schlüssel</label>
-        <div class="key-row"><input id="g-key" type="password" autocomplete="off" value="${esc(s.geminiKey)}" placeholder="AIza…"><button class="icon-btn" data-action="toggle-key" aria-label="Schlüssel zeigen">👁</button></div></div>
-      <div class="field"><label for="g-model">Modell <span class="opt">(nur ändern, wenn Google es umbenennt)</span></label><input id="g-model" value="${esc(s.model)}" autocomplete="off"></div>
-      <label class="g-item" style="padding:6px 0"><input type="checkbox" id="analyze-video" ${s.analyzeVideo !== false ? 'checked' : ''}><span class="g-main"><span class="g-name">YouTube-Videos mit anschauen</span><span class="g-src">Bild, Ton und eingeblendeter Text. Genauer, aber langsamer; zählt stärker aufs kostenlose Tageskontingent.</span></span></label>
-      <div class="btn-row"><button class="btn primary" data-action="save-key">💾 Speichern</button><button class="btn secondary" data-action="test-key">🧪 Testen</button></div>
-      <p class="lead" style="font-size:15px;margin:10px 0 0">Kostenloser Tarif: Google darf Eingaben zur Verbesserung nutzen. Für Rezepttexte unkritisch.</p>
+      <h3>🔌 Rezept-Server</h3>
+      <p>Status: ${stHtml}</p>
+      <label class="g-item" style="padding:6px 0"><input type="checkbox" id="analyze-video" ${s.analyzeVideo !== false ? 'checked' : ''}><span class="g-main"><span class="g-name">YouTube-Videos mit anschauen</span><span class="g-src">Bild, Ton und eingeblendeter Text (nur mit Gemini). Genauer, aber langsamer.</span></span></label>
+      <details><summary style="min-height:44px;display:flex;align-items:center;font-weight:700">Server-Adresse ändern</summary>
+        <div class="key-row" style="margin-top:8px"><input id="api-base" type="url" value="${esc(apiBase())}" autocomplete="off"><button class="btn secondary" data-action="save-api">Speichern</button></div></details>
     </section>
     <section class="panel">
-      <h3>📲 Kurzbefehl „Rezept speichern“ einrichten</h3>
-      <p>Einmalig in der App <strong>Kurzbefehle</strong> auf dem iPhone, ca. 5 Minuten:</p>
+      <h3>📲 Teilen-Knopf einrichten (einmalig, 2 Minuten)</h3>
+      <p>Damit erscheint in Instagram, TikTok und YouTube unter <strong>Teilen</strong> der Punkt „Rezept speichern“. Ohne Kurzbefehl geht's auch: Link kopieren → hier ＋ → 📋.</p>
       <ol class="guide">
-        <li>Kurzbefehle öffnen → <strong>＋</strong> → oben Namen tippen: <strong>Rezept speichern</strong>. Symbol nach Wunsch.</li>
-        <li>Unten <strong>ⓘ Details</strong> → <strong>„Im Share-Sheet anzeigen“</strong> einschalten. Zurück. Oben im ersten Block „Empfängt <em>Alle</em>“ antippen und nur <strong>URLs</strong> und <strong>Text</strong> anhaken. „Wenn keine Eingabe“ → <strong>Zwischenablage abfragen</strong>.</li>
-        <li>Aktion <strong>„URLs aus Eingabe abrufen“</strong> hinzufügen (Eingabe: Kurzbefehleingabe).</li>
-        <li>Aktion <strong>„Inhalte von URL abrufen“</strong> hinzufügen. Pfeil ▸ aufklappen → <strong>Header</strong> hinzufügen:<br>
-          Schlüssel <code>User-Agent</code>, Wert:
-          <div class="copy-row"><code>Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1</code><button class="icon-btn" data-action="copy" data-copy="ua" aria-label="Kopieren">📋</button></div>
-          Zweiter Header: Schlüssel <code>Accept-Language</code>, Wert <code>en</code></li>
-        <li>Aktion <strong>„Text abgleichen“</strong> hinzufügen: Muster einfügen, Eingabe „Inhalte von URL“:
-          <div class="copy-row"><code>${esc(SHORTCUT_REGEX)}</code><button class="icon-btn" data-action="copy" data-copy="regex" aria-label="Muster kopieren">📋</button></div></li>
-        <li>Aktion <strong>„Text kombinieren“</strong>: „Übereinstimmungen“ mit <strong>Eigene</strong> Trennung <code>${SHORTCUT_SEP}</code> kombinieren.</li>
-        <li>Zweimal <strong>„URL kodieren“</strong>: einmal für „Kombinierter Text“, einmal für „URLs“ (aus Schritt 3).</li>
-        <li>Aktion <strong>„Text“</strong> mit diesem Inhalt; die Platzhalter ersetzt du durch die Variablen „Kodierte URL“ (Link) und „Kodierter Text“:
-          <div class="copy-row"><code>${esc(template)}</code><button class="icon-btn" data-action="copy" data-copy="template" aria-label="Vorlage kopieren">📋</button></div></li>
-        <li>Zum Schluss <strong>„URLs öffnen“</strong> mit „Text“. Fertig – testen: Reel öffnen → Teilen → <strong>Rezept speichern</strong>.</li>
+        <li>App <strong>Kurzbefehle</strong> öffnen → <strong>＋</strong> → oben Namen: <strong>Rezept speichern</strong>.</li>
+        <li>Unten <strong>ⓘ</strong> → <strong>„Im Share-Sheet anzeigen“</strong> einschalten → Fertig.</li>
+        <li>Aktion <strong>„URL kodieren“</strong> hinzufügen (Eingabe: Kurzbefehleingabe).</li>
+        <li>Aktion <strong>„URLs öffnen“</strong> hinzufügen. In das Feld diese Adresse einfügen und direkt dahinter die Variable <strong>„Kodierte URL“</strong> setzen:
+          <div class="copy-row"><code>${esc(appUrl())}#import?u=</code><button class="icon-btn" data-action="copy" data-copy="template" aria-label="Adresse kopieren">📋</button></div></li>
+        <li>Fertig. Test: Reel öffnen → Teilen → <strong>Rezept speichern</strong>.</li>
       </ol>
-      <p class="lead" style="font-size:15px">Wichtig: Der Kurzbefehl öffnet die App in Safari. Leg sie deshalb als Lesezeichen bzw. beim Hinzufügen zum Home-Bildschirm mit ausgeschaltetem „Als Web-App öffnen“ ab, damit alle Rezepte am selben Ort landen.</p>
+      <p class="lead" style="font-size:15px">Der Kurzbefehl öffnet die App in Safari. Leg sie dort als Lesezeichen ab (bzw. beim „Zum Home-Bildschirm“ „Als Web-App öffnen“ ausschalten), damit alle Rezepte am selben Ort liegen.</p>
     </section>
   </div>
   <div>
@@ -1580,7 +1578,7 @@ function viewSettings(){
     </section>
     <section class="panel">
       <h3>💾 Backup</h3>
-      <p>Die Rezepte liegen nur in diesem Browser. Safari kann Website-Daten löschen, wenn die Seite länger nicht benutzt wird – darum regelmäßig sichern (z. B. in iCloud Drive).</p>
+      <p>Die Rezepte liegen nur auf diesem Gerät. Safari kann Website-Daten löschen, wenn die Seite länger nicht benutzt wird – darum ab und zu sichern (z. B. in iCloud Drive).</p>
       <p class="lead" style="font-size:15px">Letztes Backup: ${s.lastBackup ? new Date(s.lastBackup).toLocaleDateString('de-DE') : 'noch keins'}</p>
       <div class="btn-row"><button class="btn primary" data-action="export-backup">⬇️ Backup speichern</button>
         <label class="btn secondary" style="cursor:pointer">⬆️ Backup laden<input type="file" id="backup-file" accept="application/json,.json" hidden></label></div>
@@ -1591,7 +1589,7 @@ function viewSettings(){
   </div></div>`;
 }
 function exportBackup(){
-  const data = JSON.stringify({...state, settings:{...state.settings, geminiKey:''}}, null, 2);
+  const data = JSON.stringify(state, null, 2);
   const blob = new Blob([data], {type:'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1599,16 +1597,14 @@ function exportBackup(){
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   state.settings.lastBackup = new Date().toISOString(); save(); render();
-  toast('💾 Backup erstellt (ohne API-Schlüssel)');
+  toast('💾 Backup erstellt');
 }
 async function importBackup(file){
   try {
     const s = JSON.parse(await file.text());
     if (!s || !Array.isArray(s.recipes)) throw new Error('Keine gültige Backup-Datei');
-    if (!await confirmDialog('Backup laden?', `${s.recipes.length} Rezepte ersetzen die aktuellen ${state.recipes.length}. Dein Gemini-Schlüssel bleibt.`, 'Laden', true)) return;
-    const key = state.settings.geminiKey, model = state.settings.model;
-    state = migrate(s); state.settings.geminiKey = key; state.settings.model = model;
-    save(); render(); toast('✅ Backup geladen');
+    if (!await confirmDialog('Backup laden?', `${s.recipes.length} Rezepte ersetzen die aktuellen ${state.recipes.length}.`, 'Laden', true)) return;
+    state = migrate(s); save(); render(); toast('✅ Backup geladen');
   } catch (e) { toast('⚠ ' + e.message); }
 }
 
@@ -1648,17 +1644,14 @@ function confirmDialog(title, msg, okLabel, danger){
 /* =========================================================
    EVENTS
    ========================================================= */
-const COPY_VALUES = {
-  ua:'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
-  regex:SHORTCUT_REGEX, template:() => `${appUrl()}#import?u=[Link]&t=[Text]`
-};
+const COPY_VALUES = {template:() => `${appUrl()}#import?u=`};
 function refreshDetail(){
   const body = document.getElementById('detail-body');
   if (body) { const id = body.dataset.id; closeModal(); openDetail(id); }
 }
 const actions = {
   'nav': el => { ui.view = el.dataset.view; while (modalStack.length && !modalStack[modalStack.length - 1].sticky) closeModal(); render(); window.scrollTo(0, 0); },
-  'add-recipe': () => { const d = blankDraft(); d.folderIds = ui.folder !== 'all' ? [ui.folder] : []; openForm(d); },
+  'add-recipe': () => openAddSheet(),
   'view-recipe': el => openDetail(el.dataset.id),
   'edit-recipe': el => { const r = byId(el.dataset.id); closeModal(); openForm(clone(r)); },
   'delete-recipe': async el => {
@@ -1718,22 +1711,25 @@ const actions = {
   'toggle-hide': () => { ui.hideChecked = !ui.hideChecked; render(); },
   'uncheck-all': () => { state.checked = {}; save(); render(); },
   'copy-list': () => { const ta = document.getElementById('g-export'); copyText(ta.value, ta); },
-  'import-parse': () => { ui.importText = document.getElementById('imp').value; ui.importUrl = document.getElementById('imp-url').value.trim(); importText(ui.importText, ui.importUrl); },
-  'paste-import': async () => { try { const t = await navigator.clipboard.readText(); ui.importText = t; render(); } catch { toast('Bitte ins Textfeld lange tippen → Einsetzen'); } },
-  'toggle-key': () => { const k = document.getElementById('g-key'); k.type = k.type === 'password' ? 'text' : 'password'; },
-  'save-key': () => { state.settings.geminiKey = document.getElementById('g-key').value.trim(); state.settings.model = document.getElementById('g-model').value.trim() || 'gemini-flash-latest'; save(); render(); toast(state.settings.geminiKey ? '🔑 Schlüssel gespeichert' : 'Schlüssel entfernt'); },
-  'test-key': async el => {
-    actions['save-key']();
-    if (!state.settings.geminiKey) return;
-    toast('🧪 Teste Gemini…');
-    try { const g = await geminiCall(`${G_PROMPT}\n\nTEXT:\nPancakes\nServes 2\n200 g flour\n2 eggs\n300 ml milk\n1. Whisk everything.\n2. Fry in a pan.`); toast(`✅ Gemini funktioniert (${(g.ingredients || []).length} Zutaten erkannt)`); }
-    catch (e) { toast('⚠ ' + e.message); }
+  'manual-recipe': () => { closeModal(); const d = blankDraft(); d.folderIds = ui.folder !== 'all' ? [ui.folder] : []; openForm(d); },
+  'paste-link': async el => {
+    try {
+      const t = await navigator.clipboard.readText();
+      const url = (t.match(/https?:\/\/\S+/) || [''])[0];
+      const input = el.closest('form').querySelector('#add-link');
+      if (!url) { toast('In der Zwischenablage ist kein Link.'); return; }
+      input.value = url; el.closest('form').requestSubmit();
+    } catch { toast('Ins Feld tippen, lange drücken → Einsetzen'); }
   },
+  'paste-into': async el => { try { document.getElementById(el.dataset.target).value = await navigator.clipboard.readText(); } catch { toast('Ins Feld tippen, lange drücken → Einsetzen'); } },
+  'fill-detail': el => fillStepsInDetail(el.dataset.id),
+  'review-ok': el => { const r = byId(el.dataset.id); if (r) { delete r.review; save(); refreshDetail(); render(); } },
+  'save-api': () => { state.settings.apiBase = document.getElementById('api-base').value.trim(); save(); serverStatus = null; render(); },
   'copy': el => { const v = COPY_VALUES[el.dataset.copy]; const text = typeof v === 'function' ? v() : v; const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); copyText(text, ta).finally(() => ta.remove()); },
   'export-backup': () => exportBackup(),
   'reset-demo': async () => {
-    if (!await confirmDialog('Demo-Daten wiederherstellen?', 'Ersetzt alle Rezepte, Ordner und den Wochenplan durch die Beispiele. Dein Gemini-Schlüssel bleibt.', 'Zurücksetzen', true)) return;
-    const s = state.settings; state = seedState(); state.settings = {...state.settings, geminiKey:s.geminiKey, model:s.model}; save(); render(); toast('↺ Demo-Daten wiederhergestellt');
+    if (!await confirmDialog('Demo-Daten wiederherstellen?', 'Ersetzt alle Rezepte, Ordner und den Wochenplan durch die Beispiele.', 'Zurücksetzen', true)) return;
+    const s = state.settings; state = seedState(); state.settings = {...state.settings, apiBase:s.apiBase, analyzeVideo:s.analyzeVideo}; save(); render(); toast('↺ Demo-Daten wiederhergestellt');
   }
 };
 function clearFieldState(el){ const f = el.closest('.field'); if (f) { f.classList.remove('flagged', 'invalid'); const e = f.querySelector(':scope > .err'); if (e) e.textContent = ''; } }
@@ -1747,22 +1743,20 @@ document.addEventListener('click', e => {
 document.addEventListener('input', e => {
   if (e.target.id === 'q') { ui.q = e.target.value; document.getElementById('lib-results').innerHTML = libraryResults(); }
   else if (e.target.id === 'pick-q') document.getElementById('pick-list').innerHTML = pickerList(e.target.value);
-  else if (e.target.id === 'imp') ui.importText = e.target.value;
-  else if (e.target.id === 'imp-url') ui.importUrl = e.target.value;
 });
 document.addEventListener('change', e => {
   if (e.target.dataset.gkey) { const k = e.target.dataset.gkey; if (e.target.checked) state.checked[k] = true; else delete state.checked[k]; save(); render(); }
   if (e.target.id === 'backup-file' && e.target.files[0]) importBackup(e.target.files[0]);
-  if (e.target.id === 'img-file' && e.target.files.length) { importImages(e.target.files); e.target.value = ''; }
+  if (e.target.id === 'img-file' && e.target.files.length) { const files = [...e.target.files]; importImages(files, e.target.dataset.link || ''); e.target.value = ''; }
   if (e.target.id === 'analyze-video') { state.settings.analyzeVideo = e.target.checked; save(); }
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && modalStack.length && !modalStack[modalStack.length - 1].sticky) closeModal();
 });
 window.addEventListener('hashchange', handleIncoming);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') persist(); });
 
-render();
-handleIncoming();
+boot();
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
 </body>

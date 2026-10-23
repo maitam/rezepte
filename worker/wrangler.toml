@@ -1,0 +1,11 @@
+name = "rezepte-api"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Kostenlose Cloudflare-KI als Standard. Gemini wird zusätzlich genutzt, sobald das Secret
+# GEMINI_API_KEY gesetzt ist:  npx wrangler secret put GEMINI_API_KEY
+[ai]
+binding = "AI"
+
+[vars]
+ALLOWED_ORIGINS = "https://maitam.github.io,http://127.0.0.1:5791,http://localhost:5791"

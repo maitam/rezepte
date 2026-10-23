@@ -1,5 +1,5 @@
 // Offline-Cache: erst Netz (damit Updates ankommen), sonst Cache.
-const CACHE = 'rezepte-v3';
+const CACHE = 'rezepte-v4';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
