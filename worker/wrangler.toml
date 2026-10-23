@@ -9,5 +9,4 @@ keep_vars = true
 [ai]
 binding = "AI"
 
-[vars]
-ALLOWED_ORIGINS = "https://maitam.github.io,http://127.0.0.1:5791,http://localhost:5791"
+# ALLOWED_ORIGINS ist im Cloudflare-Dashboard als Secret gesetzt (Standard im Code: https://maitam.github.io).

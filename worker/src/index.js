@@ -201,14 +201,20 @@ export async function scrape(link) {
 const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
 async function gemini(env, text, mediaParts) {
   const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
+  const isVideo = mediaParts.some(p => p.file_data);
   let lastErr;
-  for (const model of [...new Set(models)]) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY},
-      body: JSON.stringify({contents: [{role: 'user', parts: [...mediaParts, {text}]}],
-        generationConfig: {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0}})
-    });
+  for (const model of [...new Set(models)].slice(0, isVideo ? 2 : 4)) {
+    const config = {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0};
+    if (isVideo) config.mediaResolution = 'MEDIA_RESOLUTION_LOW'; // weniger Bildpunkte → deutlich schneller
+    let res;
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY},
+        body: JSON.stringify({contents: [{role: 'user', parts: [...mediaParts, {text}]}], generationConfig: config}),
+        signal: AbortSignal.timeout(isVideo ? 90000 : 45000)
+      });
+    } catch (e) { lastErr = new Error(e.name === 'TimeoutError' ? 'Gemini hat zu lange gebraucht' : e.message); continue; }
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
       const t = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('');
@@ -219,7 +225,7 @@ async function gemini(env, text, mediaParts) {
     const msg = (data.error && data.error.message) || 'HTTP ' + res.status;
     lastErr = new Error(res.status === 503 || /high demand|overloaded/i.test(msg) ? 'Gemini ist gerade überlastet'
       : res.status === 429 ? 'Gemini-Tageskontingent erreicht' : 'Gemini: ' + msg);
-    if (![429, 500, 503, 404].includes(res.status)) break; // z. B. ungültiger Schlüssel: nicht weiter probieren
+    if (![429, 500, 503, 504, 524, 404].includes(res.status)) break; // z. B. ungültiger Schlüssel: nicht weiter probieren
   }
   throw lastErr;
 }
@@ -247,7 +253,10 @@ export async function extract(body, env) {
   const extraText = String(body.text || '').replace(link, '').trim();
   const text = [page.caption, extraText].filter(Boolean).join('\n\n');
   const result = {...page, recipe: null, ai: null, aiMode: '', aiError: ''};
-  const useVideo = page.platform === 'youtube' && page.videoUrl && body.video !== false;
+  // Video nur ansehen, wenn die Beschreibung kein Rezept enthält (spart 1–2 Minuten).
+  const amountLines = (text.match(/^\s*[-•*]?\s*(\d|½|¼|¾|⅓)[^\n]{2,}/gm) || []).length + (text.match(/\d+\s*(g|ml|tbsp|tsp|cups?|el|tl)\b/gi) || []).length;
+  const captionHasRecipe = amountLines >= 4;
+  const useVideo = page.platform === 'youtube' && page.videoUrl && body.video !== false && !captionHasRecipe;
   if (images.length && !text && !env.GEMINI_API_KEY) { result.aiError = 'Fotos kann der Server erst lesen, wenn Gemini eingerichtet ist.'; return result; }
   if (!text && !images.length && !(useVideo && env.GEMINI_API_KEY)) {
     result.aiError = page.loginWall ? 'Instagram verlangt gerade einen Login – Beschreibung nicht lesbar. In ein paar Minuten nochmal versuchen.'
