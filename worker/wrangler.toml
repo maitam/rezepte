@@ -1,6 +1,8 @@
 name = "rezepte-api"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
+# Im Dashboard angelegte Variablen bei Updates nicht überschreiben
+keep_vars = true
 
 # Kostenlose Cloudflare-KI als Standard. Gemini wird zusätzlich genutzt, sobald das Secret
 # GEMINI_API_KEY gesetzt ist:  npx wrangler secret put GEMINI_API_KEY

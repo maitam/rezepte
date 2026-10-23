@@ -197,19 +197,31 @@ export async function scrape(link) {
 }
 
 /* ---------- KI ---------- */
+// Bei Überlastung (503/429) das nächste Modell probieren; alle sind im kostenlosen Tarif enthalten.
+const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
 async function gemini(env, text, mediaParts) {
-  const model = env.GEMINI_MODEL || 'gemini-flash-latest';
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY},
-    body: JSON.stringify({contents: [{role: 'user', parts: [...mediaParts, {text}]}],
-      generationConfig: {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0}})
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data.error && data.error.message) || 'Gemini HTTP ' + res.status);
-  const t = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('');
-  if (!t) throw new Error('Leere Antwort von Gemini');
-  return JSON.parse(t);
+  const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
+  let lastErr;
+  for (const model of [...new Set(models)]) {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY},
+      body: JSON.stringify({contents: [{role: 'user', parts: [...mediaParts, {text}]}],
+        generationConfig: {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0}})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      const t = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('');
+      if (t) { const r = JSON.parse(t); r._model = model; return r; }
+      lastErr = new Error('Leere Antwort von Gemini');
+      continue;
+    }
+    const msg = (data.error && data.error.message) || 'HTTP ' + res.status;
+    lastErr = new Error(res.status === 503 || /high demand|overloaded/i.test(msg) ? 'Gemini ist gerade überlastet'
+      : res.status === 429 ? 'Gemini-Tageskontingent erreicht' : 'Gemini: ' + msg);
+    if (![429, 500, 503, 404].includes(res.status)) break; // z. B. ungültiger Schlüssel: nicht weiter probieren
+  }
+  throw lastErr;
 }
 async function workersAI(env, text) {
   const model = env.WORKERS_AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
