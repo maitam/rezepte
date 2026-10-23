@@ -200,8 +200,10 @@ export async function scrape(link) {
 // Bei Überlastung (503/429) das nächste Modell probieren; alle sind im kostenlosen Tarif enthalten.
 const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
 async function gemini(env, text, mediaParts) {
-  const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...GEMINI_MODELS] : GEMINI_MODELS;
   const isVideo = mediaParts.some(p => p.file_data);
+  // Nur Text: das schnelle Lite-Modell zuerst (3–8 Sek.); Video/Fotos: das stärkere Flash-Modell.
+  const order = mediaParts.length ? GEMINI_MODELS : ['gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash'];
+  const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...order] : order;
   let lastErr;
   for (const model of [...new Set(models)].slice(0, isVideo ? 2 : 4)) {
     const config = {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0};
