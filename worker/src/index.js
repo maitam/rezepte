@@ -108,17 +108,59 @@ function ldRecipeText(html) {
   return null;
 }
 
+/* YouTube: interne Player-Schnittstelle liefert Titel und Beschreibung auch ohne Cookie-Banner. */
+export async function youtubeDetails(id) {
+  const clients = [
+    {clientName: 'WEB', clientVersion: '2.20250101.00.00'},
+    {clientName: 'ANDROID', clientVersion: '19.44.38', androidSdkVersion: 30},
+    {clientName: 'IOS', clientVersion: '19.45.4', deviceModel: 'iPhone16,2'}
+  ];
+  for (const client of clients) {
+    try {
+      const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST', headers: {'Content-Type': 'application/json', 'User-Agent': UA},
+        body: JSON.stringify({videoId: id, context: {client: {...client, hl: 'en', gl: 'DE'}}})
+      });
+      const j = await r.json();
+      const v = j && j.videoDetails;
+      if (v && v.shortDescription) return {title: v.title || '', caption: v.shortDescription};
+    } catch {}
+  }
+  return null;
+}
+/* Instagram: die öffentliche Einbettungs-Seite zeigt die Caption auch ohne Login. */
+export async function instagramEmbed(link) {
+  const m = String(link).match(/instagram\.com\/(?:[\w.]+\/)?(p|reel|reels|tv)\/([\w-]+)/i);
+  if (!m) return null;
+  const kind = m[1].toLowerCase().startsWith('reel') ? 'reel' : m[1];
+  const r = await fetch(`https://www.instagram.com/${kind}/${m[2]}/embed/captioned/`, {headers: {'User-Agent': UA, 'Accept-Language': 'en'}});
+  const html = await r.text();
+  const cap = html.match(/class="Caption"[^>]*>([\s\S]*?)<div class="CaptionComments"/) || html.match(/class="Caption"[^>]*>([\s\S]*?)<\/div>/);
+  let caption = '';
+  if (cap) {
+    caption = decodeEntities(cap[1].replace(/<a[^>]*class="CaptionUsername"[^>]*>[\s\S]*?<\/a>/, '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')).replace(/[ \t]+\n/g, '\n').trim();
+  }
+  if (!caption) {
+    const j = html.match(/\\"caption\\":\{[^}]*?\\"text\\":\\"((?:[^\\]|\\\\.)*?)\\"/);
+    if (j) { try { caption = JSON.parse(JSON.parse(`"${j[1]}"`.replace(/\\\\/g, '\\'))); } catch {} }
+  }
+  const img = html.match(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/) || html.match(/<img[^>]+src="(https:\/\/[^"]*(?:cdninstagram|fbcdn)[^"]+)"/);
+  return {caption, imageUrl: img ? decodeEntities(img[1]) : '', status: r.status};
+}
+
 export async function scrape(link) {
   const platform = platformOf(link);
   const out = {link, platform, title: '', caption: '', imageUrl: '', status: 0, finalUrl: link};
-  const res = await fetch(link, {headers: {'User-Agent': UA, 'Accept-Language': 'en,de;q=0.8', 'Accept': 'text/html'}, redirect: 'follow'});
+  const res = await fetch(link, {headers: {'User-Agent': UA, 'Accept-Language': 'en,de;q=0.8', 'Accept': 'text/html', 'Cookie': 'CONSENT=YES+cb; SOCS=CAI'}, redirect: 'follow'});
   out.status = res.status; out.finalUrl = res.url || link;
   const html = await res.text();
   if (platform === 'youtube') {
-    const d = html.match(/"shortDescription":("(?:[^"\\]|\\.)*")/);
-    out.caption = d ? unjson(d[1]) : meta(html, 'og:description');
-    out.title = meta(html, 'og:title') || meta(html, 'title');
     const id = youtubeId(out.finalUrl) || youtubeId(link);
+    const d = html.match(/"shortDescription":("(?:[^"\\]|\\.)*")/);
+    out.caption = d ? unjson(d[1]) : '';
+    out.title = meta(html, 'og:title') || meta(html, 'title');
+    if (!out.caption && id) { const yt = await youtubeDetails(id); if (yt) { out.caption = yt.caption; out.title = out.title || yt.title; out.via = 'player-api'; } }
+    if (!out.caption) out.caption = meta(html, 'og:description');
     out.videoUrl = id ? `https://www.youtube.com/watch?v=${id}` : '';
     out.imageUrl = id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : meta(html, 'og:image');
   } else if (platform === 'tiktok') {
@@ -134,7 +176,12 @@ export async function scrape(link) {
     if (ig && /likes|comments|gefällt|kommentar/i.test(d.slice(0, 120))) d = ig[1];
     out.caption = d;
     out.imageUrl = meta(html, 'og:image');
-    out.loginWall = !d && /login|accounts\/login/i.test(out.finalUrl + html.slice(0, 3000));
+    if (!d) {
+      const e = await instagramEmbed(link).catch(() => null);
+      if (e && e.caption) { out.caption = e.caption; out.imageUrl = out.imageUrl || e.imageUrl; out.via = 'embed'; }
+      else if (e && e.imageUrl) out.imageUrl = out.imageUrl || e.imageUrl;
+    }
+    out.loginWall = !out.caption && /login|accounts\/login/i.test(out.finalUrl + html.slice(0, 3000));
   } else {
     const ld = ldRecipeText(html);
     if (ld) { out.caption = ld.text; out.title = ld.title; out.imageUrl = ld.image || meta(html, 'og:image'); out.structured = true; }
@@ -191,7 +238,9 @@ export async function extract(body, env) {
   const useVideo = page.platform === 'youtube' && page.videoUrl && body.video !== false;
   if (images.length && !text && !env.GEMINI_API_KEY) { result.aiError = 'Fotos kann der Server erst lesen, wenn Gemini eingerichtet ist.'; return result; }
   if (!text && !images.length && !(useVideo && env.GEMINI_API_KEY)) {
-    result.aiError = page.loginWall ? 'Instagram verlangt gerade einen Login – Beschreibung nicht lesbar.' : (page.error || 'Keine Beschreibung gefunden.');
+    result.aiError = page.loginWall ? 'Instagram verlangt gerade einen Login – Beschreibung nicht lesbar. In ein paar Minuten nochmal versuchen.'
+      : page.platform === 'youtube' ? 'YouTube blockiert den Rezept-Server. Mit eingerichtetem Gemini klappt YouTube (Gemini schaut das Video direkt an).'
+      : (page.error || 'Keine Beschreibung gefunden.');
     return result;
   }
   const prompt = `${PROMPT}\n\nSOURCE URL: ${link || '-'}\nVIDEO TITLE: ${page.title || '-'}\n\nTEXT:\n${text || '(no text – use the attached media)'}`;
@@ -233,6 +282,10 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, {headers: cors});
     try {
       if (url.pathname === '/health') return json({ok: true, ai: env.GEMINI_API_KEY ? 'gemini' : env.AI ? 'workers-ai' : 'none'}, 200, cors);
+      if (url.pathname === '/check') { // nur Seitenabruf, ohne KI – zum Testen
+        const p = await scrape(firstUrl(url.searchParams.get('u')));
+        return json({platform: p.platform, status: p.status, finalUrl: p.finalUrl, via: p.via || 'page', title: p.title, captionLength: p.caption.length, captionStart: p.caption.slice(0, 120), image: !!p.imageUrl}, 200, cors);
+      }
       if (!ok) return json({error: 'Nicht erlaubt'}, 403, cors);
       if (url.pathname === '/extract' && req.method === 'POST') return json(await extract(await req.json(), env), 200, cors);
       if (url.pathname === '/img') return proxyImage(url.searchParams.get('u'), cors);
