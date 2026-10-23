@@ -516,7 +516,7 @@ function I(quantity, unit, name, aisle, note, original){
 }
 function S(text){ return {id:uid(), text}; }
 function emptyPlan(){ return Object.fromEntries(DAYS.map(([d]) => [d, {breakfast:null, lunch:null, dinner:null}])); }
-function defaultSettings(){ return {geminiKey:'', model:'gemini-flash-latest', unitMode:'original', lastFolderIds:[], lastBackup:null}; }
+function defaultSettings(){ return {geminiKey:'', model:'gemini-flash-latest', unitMode:'original', analyzeVideo:true, lastFolderIds:[], lastBackup:null}; }
 
 function seedState(){
   const now = new Date().toISOString();
@@ -1189,10 +1189,12 @@ const G_SCHEMA = {
     difficulty:{type:'STRING', enum:DIFFS}, mealTypes:{type:'ARRAY', items:{type:'STRING', enum:MEAL_TYPES}}, tags:{type:'ARRAY', items:{type:'STRING'}},
     ingredients:{type:'ARRAY', items:{type:'OBJECT', properties:{
       original:{type:'STRING'}, quantity:{type:'NUMBER', nullable:true}, unit:{type:'STRING', enum:UNITS.map(u => u.id)},
-      name:{type:'STRING'}, note:{type:'STRING'}, aisle:{type:'STRING', enum:AISLES.map(a => a.id)}}, required:['original','unit','name']}},
-    steps:{type:'ARRAY', items:{type:'STRING'}}, missing:{type:'ARRAY', items:{type:'STRING'}}
+      name:{type:'STRING'}, note:{type:'STRING'}, aisle:{type:'STRING', enum:AISLES.map(a => a.id)},
+      source:{type:'STRING', enum:['text','video','image','guess']}}, required:['original','unit','name','source']}},
+    steps:{type:'ARRAY', items:{type:'STRING'}}, missing:{type:'ARRAY', items:{type:'STRING'}},
+    confidence:{type:'INTEGER'}, bestGuess:{type:'BOOLEAN'}
   },
-  required:['title','ingredients','steps']
+  required:['title','ingredients','steps','confidence']
 };
 const G_PROMPT = `You extract a cooking recipe from a social-media caption, video description or pasted text.
 Rules:
@@ -1209,15 +1211,26 @@ Rules:
 8. Ignore ads, sponsor mentions, prices, hashtags, emojis-only lines and calls to action.
 9. title = dish name in Title Case without emojis. description = one short sentence from the text or "".
 10. servings from "serves 4"/"für 4 Personen"/"4 Portionen", else null. prepMinutes/cookMinutes only if stated, else null.
-11. mealTypes and difficulty: your best judgement. tags: up to 4 short lowercase tags in the text's language.`;
+11. mealTypes and difficulty: your best judgement. tags: up to 4 short lowercase tags in the text's language.
+12. ingredients[].source: "text" if it comes from the given TEXT, "video" if only shown or spoken in an attached video, "image" if read from an attached image, "guess" if estimated.
+13. If a video is attached: watch it, listen to the narration and read on-screen text. Merge it with the TEXT; the TEXT wins on conflicts. For items only in the video, original = the wording as spoken or shown.
+14. confidence: 0-100, how sure you are that ingredients and steps are complete and correct.
+15. bestGuess: false, unless stated otherwise below.`;
+const G_IMAGE_PROMPT = `The attached image(s) show a recipe: screenshot, cookbook page, handwritten card or photo carousel slides (in order).
+Read all text in the images. original = the line exactly as written in the image. source = "image".
+If the images show only a finished dish and no recipe text, identify the dish and write a realistic best-guess recipe: bestGuess true, source "guess", confidence at most 40.`;
+function youtubeWatchUrl(url){
+  const m = String(url || '').match(/(?:youtu\.be\/|v=|shorts\/|embed\/)([\w-]{11})/);
+  return m ? `https://www.youtube.com/watch?v=${m[1]}` : '';
+}
 
-async function geminiCall(prompt){
+async function geminiCall(prompt, mediaParts = []){
   const s = state.settings;
   if (!s.geminiKey) throw new Error('NO_KEY');
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(s.model || 'gemini-flash-latest')}:generateContent`, {
     method:'POST',
     headers:{'Content-Type':'application/json', 'x-goog-api-key':s.geminiKey},
-    body:JSON.stringify({contents:[{role:'user', parts:[{text:prompt}]}],
+    body:JSON.stringify({contents:[{role:'user', parts:[...mediaParts, {text:prompt}]}],
       generationConfig:{responseMimeType:'application/json', responseSchema:G_SCHEMA, temperature:0}})
   });
   const data = await res.json().catch(() => ({}));
@@ -1243,7 +1256,11 @@ function draftFromGemini(g, sourceText, url){
     const i = {id:uid(), original:String(x.original || '').trim(), quantity:typeof x.quantity === 'number' && x.quantity > 0 ? x.quantity : null,
       unit:UNIT[x.unit] ? x.unit : 'pc', name:String(x.name || '').trim().slice(0, 80), note:String(x.note || '').trim().slice(0, 120), aisle:AISLE[x.aisle] ? x.aisle : guessAisle(x.name)};
     if (i.quantity == null && i.unit !== 'taste') i.unit = 'taste';
-    if (i.original && !src.includes(normWs(i.original))) { i._flag = true; i._why = '⚠ Steht so nicht wörtlich im Text – bitte vergleichen.'; notVerbatim++; }
+    const from = x.source || 'text';
+    if (from === 'video') i._why = '🎬 Aus dem Video (gesprochen oder eingeblendet)';
+    else if (from === 'image') {}
+    else if (from === 'guess') { i._flag = true; i._why = '⚠ Geschätzt – bitte prüfen.'; }
+    else if (i.original && !src.includes(normWs(i.original))) { i._flag = true; i._why = '⚠ Steht so nicht wörtlich im Text – bitte vergleichen.'; notVerbatim++; }
     if (!i.name) { i._flag = true; i._why = '⚠ Name fehlt.'; }
     if (i.unit === 'taste') noQty++;
     return i;
@@ -1253,7 +1270,10 @@ function draftFromGemini(g, sourceText, url){
   if (!d.ingredients.length) flags.add('ingredients');
   if (!d.steps.length) flags.add('steps');
   flags.add('mealTypes');
-  report.push({ok:true, label:'Gelesen mit', detail:'Gemini (' + (state.settings.model || 'gemini-flash-latest') + ')'});
+  d._confidence = Math.max(0, Math.min(100, +g.confidence || 0));
+  d._bestGuess = !!g.bestGuess;
+  report.push({ok:true, label:'Gelesen mit', detail:'Gemini (' + (state.settings.model || 'gemini-flash-latest') + ')' + (g._mode ? ' · ' + g._mode : '')});
+  report.push({ok:d._confidence >= 70, label:'Sicherheit', detail:`${d._confidence} %${d._bestGuess ? ' · geschätztes Rezept nach Foto' : ''}`});
   report.push({ok:!!d.title, label:'Titel', detail:d.title || 'nicht gefunden'});
   report.push({ok:d.ingredients.length > 0 && !notVerbatim, label:'Zutaten', detail:`${d.ingredients.length} erkannt${notVerbatim ? ` · ${notVerbatim} nicht wörtlich gefunden` : ' · alle wörtlich im Text gefunden'}${noQty ? ` · ${noQty} ohne Menge` : ''}`});
   report.push({ok:d.steps.length > 0, label:'Zubereitung', detail:d.steps.length ? `${d.steps.length} Schritte` : 'fehlt – steht wohl im Kommentar'});
@@ -1372,29 +1392,77 @@ function localParse(text, url, titleHint){
 async function importText(text, url, titleHint){
   const caption = cleanCaption(text);
   if (!caption && !url) { toast('Füge zuerst einen Link oder Rezepttext ein.'); return; }
-  if (!caption) { // nur Link, kein Text
+  if (!caption && !(state.settings.geminiKey && youtubeWatchUrl(url))) { // nur Link, kein Text
     ui.view = 'import'; ui.importUrl = url; render();
     toast('Beschreibung konnte nicht geladen werden – bitte Text einfügen.');
     return;
   }
   let res, err = '';
+  const yt = state.settings.analyzeVideo !== false ? youtubeWatchUrl(url) : '';
   if (state.settings.geminiKey) {
-    const spin = openModal({cls:'small', html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>Rezept wird gelesen…</strong><br><span class="lead">Gemini sortiert Zutaten und Schritte.</span></p></div>`});
-    try { res = draftFromGemini(await geminiCall(`${G_PROMPT}\n\nSOURCE URL: ${url || '-'}\nVIDEO TITLE: ${titleHint || '-'}\n\nTEXT:\n${caption}`), caption, url); }
-    catch (e) { err = e.message === 'NO_KEY' ? '' : e.message; }
+    const spin = openModal({cls:'small', html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>Rezept wird gelesen…</strong><br><span class="lead">${yt ? 'Gemini schaut das Video an, hört zu und liest die Beschreibung. Das dauert bis zu einer Minute.' : 'Gemini sortiert Zutaten und Schritte.'}</span></p></div>`});
+    const prompt = `${G_PROMPT}\n\nSOURCE URL: ${url || '-'}\nVIDEO TITLE: ${titleHint || '-'}\n\nTEXT:\n${caption || '(no text – use the video)'}`;
+    if (yt) {
+      try { const g = await geminiCall(prompt, [{file_data:{file_uri:yt}}]); g._mode = 'Video + Ton + Beschreibung'; res = draftFromGemini(g, caption, url); }
+      catch (e) { err = 'Video konnte nicht ausgewertet werden (' + e.message + '), nur Beschreibung gelesen.'; }
+    }
+    if (!res && caption) {
+      try { const g = await geminiCall(prompt); g._mode = 'Beschreibung'; res = draftFromGemini(g, caption, url); if (yt) res.report.push({ok:false, label:'Video', detail:err}); err = ''; }
+      catch (e) { err = e.message === 'NO_KEY' ? '' : e.message; }
+    }
     if (modalStack.length && modalStack[modalStack.length - 1].wrap.contains(spin)) closeModal();
   }
+  if (!res && !caption) { ui.view = 'import'; ui.importUrl = url; render(); toast('⚠ ' + (err || 'Keine Beschreibung gefunden.')); return; }
   if (!res) res = localParse(caption, url, titleHint);
+  showImportResult(res, err);
+}
+function showImportResult(res, err){
   ui.lastReport = {title:res.draft.title, items:res.report, error:err};
   if (ui.view === 'import') render();
   const missingSteps = res.flags.has('steps');
   const n = res.draft.ingredients.filter(i => i._flag).length;
-  const msg = [`📥 Importiert${state.settings.geminiKey && !err ? ' mit Gemini' : ''}.`];
+  const viaGemini = res.draft._confidence != null;
+  const msg = [`📥 Importiert${viaGemini ? ` mit Gemini · Sicherheit ${res.draft._confidence} %` : ''}.`];
+  if (res.draft._bestGuess) msg.push('<strong>Geschätztes Rezept</strong> – nur nach dem Foto, kein Originaltext.');
   if (err) msg.push(`Gemini-Fehler: ${esc(err)} – einfacher Parser benutzt.`);
   if (n) msg.push(`<strong>${n} Zutat${n > 1 ? 'en' : ''}</strong> bitte prüfen.`);
   if (missingSteps) msg.push('<strong>Zubereitung fehlt</strong> – unten aus dem Kommentar einfügen.');
   if (!n && !missingSteps && !err) msg.push('Alles erkannt – kurz prüfen und speichern.');
-  openForm(res.draft, {flags:[...res.flags].filter(f => !(state.settings.geminiKey && !err && f === 'difficulty')), banner:msg.join(' '), bannerType:(n || missingSteps || err) ? 'warn' : 'ok'});
+  const warn = n || missingSteps || err || res.draft._bestGuess || (viaGemini && res.draft._confidence < 70);
+  openForm(res.draft, {flags:[...res.flags].filter(f => !(viaGemini && f === 'difficulty')), banner:msg.join(' '), bannerType:warn ? 'warn' : 'ok'});
+}
+
+/* ---------- Fotos & Screenshots ---------- */
+function shrinkImage(file, max = 1600){
+  return new Promise((resolve, reject) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Bild konnte nicht gelesen werden')); };
+    img.src = url;
+  });
+}
+async function importImages(files){
+  const list = [...files].filter(f => f.type.startsWith('image/')).slice(0, 10);
+  if (!list.length) return;
+  if (!state.settings.geminiKey) { toast('Für Fotos wird der Gemini-Schlüssel gebraucht (⚙️ Mehr).'); return; }
+  const spin = openModal({cls:'small', html:`<div class="sheet-body" style="text-align:center"><div class="spinner" aria-hidden="true"></div><p><strong>${list.length} Bild${list.length > 1 ? 'er werden' : ' wird'} gelesen…</strong></p></div>`});
+  let res, err = '';
+  try {
+    const parts = [];
+    for (const f of list) parts.push({inline_data:{mime_type:'image/jpeg', data:await shrinkImage(f)}});
+    const g = await geminiCall(`${G_PROMPT}\n\n${G_IMAGE_PROMPT}\n\nTEXT:\n${ui.importText.trim() || '(none – use the images)'}`, parts);
+    g._mode = `${list.length} Bild${list.length > 1 ? 'er' : ''}`;
+    res = draftFromGemini(g, ui.importText, ui.importUrl.trim());
+  } catch (e) { err = e.message; }
+  if (modalStack.length && modalStack[modalStack.length - 1].wrap.contains(spin)) closeModal();
+  if (!res) { toast('⚠ ' + err); return; }
+  showImportResult(res, '');
 }
 
 async function applyFill(form){
@@ -1440,7 +1508,9 @@ function viewImport(){
       <div class="btn-row">
         <button class="btn primary" data-action="import-parse">✨ Rezept erkennen</button>
         <button class="btn secondary" data-action="paste-import">📋 Aus Zwischenablage</button>
+        <label class="btn secondary" style="cursor:pointer">📷 Fotos / Screenshots<input type="file" id="img-file" accept="image/*" multiple hidden></label>
       </div>
+      <p class="lead" style="font-size:15px;margin-top:10px">Fotos: Kochbuchseite, handgeschriebene Karte, Screenshots einer Instagram-Slideshow (bis 10, in Reihenfolge) – oder nur ein Foto vom Gericht, dann schätzt Gemini ein Rezept.</p>
       ${state.settings.geminiKey ? '' : `<p class="banner warn" style="margin-top:14px">Ohne Gemini-Schlüssel läuft nur der einfache Parser. Schlüssel unter <button class="btn ghost" data-action="nav" data-view="settings" style="min-height:0;padding:0 4px">⚙️ Mehr</button> eintragen.</p>`}
     </div>
     <aside class="panel">
@@ -1448,7 +1518,8 @@ function viewImport(){
             : `<h3>So klappt's am besten</h3><ul class="hint-list">
                 <li>Die Zutaten werden <strong>1:1 als Originalzeile</strong> gespeichert. Beim Ansehen kannst du auf <strong>g / ml</strong> umschalten.</li>
                 <li>Steht die Zubereitung im angepinnten Kommentar: Kommentar kopieren und im Formular unter „Zubereitung“ einfügen.</li>
-                <li>Mit Gemini werden auch Rezepte in einem einzigen Absatz (typisch TikTok) sauber getrennt.</li></ul>`}
+                <li>Mit Gemini werden auch Rezepte in einem einzigen Absatz (typisch TikTok) sauber getrennt.</li>
+                <li>Bei <strong>YouTube</strong> schaut Gemini zusätzlich das Video an: gesprochene Mengen und eingeblendete Texte werden mit ausgewertet (🎬 markiert).</li></ul>`}
     </aside>
   </div>`;
 }
@@ -1475,6 +1546,7 @@ function viewSettings(){
       <div class="field"><label for="g-key">API-Schlüssel</label>
         <div class="key-row"><input id="g-key" type="password" autocomplete="off" value="${esc(s.geminiKey)}" placeholder="AIza…"><button class="icon-btn" data-action="toggle-key" aria-label="Schlüssel zeigen">👁</button></div></div>
       <div class="field"><label for="g-model">Modell <span class="opt">(nur ändern, wenn Google es umbenennt)</span></label><input id="g-model" value="${esc(s.model)}" autocomplete="off"></div>
+      <label class="g-item" style="padding:6px 0"><input type="checkbox" id="analyze-video" ${s.analyzeVideo !== false ? 'checked' : ''}><span class="g-main"><span class="g-name">YouTube-Videos mit anschauen</span><span class="g-src">Bild, Ton und eingeblendeter Text. Genauer, aber langsamer; zählt stärker aufs kostenlose Tageskontingent.</span></span></label>
       <div class="btn-row"><button class="btn primary" data-action="save-key">💾 Speichern</button><button class="btn secondary" data-action="test-key">🧪 Testen</button></div>
       <p class="lead" style="font-size:15px;margin:10px 0 0">Kostenloser Tarif: Google darf Eingaben zur Verbesserung nutzen. Für Rezepttexte unkritisch.</p>
     </section>
@@ -1681,6 +1753,8 @@ document.addEventListener('input', e => {
 document.addEventListener('change', e => {
   if (e.target.dataset.gkey) { const k = e.target.dataset.gkey; if (e.target.checked) state.checked[k] = true; else delete state.checked[k]; save(); render(); }
   if (e.target.id === 'backup-file' && e.target.files[0]) importBackup(e.target.files[0]);
+  if (e.target.id === 'img-file' && e.target.files.length) { importImages(e.target.files); e.target.value = ''; }
+  if (e.target.id === 'analyze-video') { state.settings.analyzeVideo = e.target.checked; save(); }
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && modalStack.length && !modalStack[modalStack.length - 1].sticky) closeModal();
