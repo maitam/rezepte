@@ -199,14 +199,14 @@ export async function scrape(link) {
 /* ---------- KI ---------- */
 // Bei Überlastung (503/429) das nächste Modell probieren; alle sind im kostenlosen Tarif enthalten.
 const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
-async function gemini(env, text, mediaParts) {
+async function gemini(env, text, mediaParts, schema = SCHEMA) {
   const isVideo = mediaParts.some(p => p.file_data);
   // Nur Text: das schnelle Lite-Modell zuerst (3–8 Sek.); Video/Fotos: das stärkere Flash-Modell.
   const order = mediaParts.length ? GEMINI_MODELS : ['gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash'];
   const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL, ...order] : order;
   let lastErr;
   for (const model of [...new Set(models)].slice(0, isVideo ? 2 : 4)) {
-    const config = {responseMimeType: 'application/json', responseSchema: toGemini(SCHEMA), temperature: 0};
+    const config = {responseMimeType: 'application/json', responseSchema: toGemini(schema), temperature: 0};
     if (isVideo) config.mediaResolution = 'MEDIA_RESOLUTION_LOW'; // weniger Bildpunkte → deutlich schneller
     let res;
     try {
@@ -285,6 +285,29 @@ export async function extract(body, env) {
   return result;
 }
 
+/* Zusatzfunktionen: Übersetzen, Nährwerte schätzen, Zutaten auf einem Kühlschrank-Foto erkennen. */
+const ENRICH = {
+  translate: {
+    schema: {type: 'object', properties: {title: {type: 'string'}, ingredients: {type: 'array', items: {type: 'string'}}, steps: {type: 'array', items: {type: 'string'}}}, required: ['title', 'ingredients', 'steps']},
+    prompt: b => `Translate this recipe into ${b.lang || 'German'}. Keep every ingredient line as one line, in the same order, with the same amounts and units (do not convert units). Translate cooking terms naturally, as a native home cook would write them. Return the same number of ingredients and steps.\n\n${JSON.stringify({title: b.title, ingredients: b.ingredients, steps: b.steps})}`
+  },
+  nutrition: {
+    schema: {type: 'object', properties: {kcal: {type: 'integer'}, protein: {type: 'number'}, carbs: {type: 'number'}, fat: {type: 'number'}, fiber: {type: 'number'}, note: {type: 'string'}}, required: ['kcal', 'protein', 'carbs', 'fat']},
+    prompt: b => `Estimate the nutrition values PER SERVING for this recipe (${b.servings || 2} servings). Use typical values for the ingredients; for items without amount ("to taste") assume small amounts. Grams with one decimal. note: one short German sentence about the biggest uncertainty.\n\nIngredients:\n${(b.ingredients || []).join('\n')}`
+  },
+  pantry: {
+    schema: {type: 'object', properties: {items: {type: 'array', items: {type: 'string'}}}, required: ['items']},
+    prompt: () => 'List the food items visible in the image(s) (fridge, pantry or groceries). One generic ingredient name per entry in German, singular, lowercase (e.g. "ei", "milch", "paprika"). Ignore packaging details and brands.'
+  }
+};
+export async function enrich(body, env) {
+  const task = ENRICH[body.task];
+  if (!task) throw new Error('Unbekannte Aufgabe');
+  if (!env.GEMINI_API_KEY) throw new Error('Dafür wird Gemini auf dem Server gebraucht.');
+  const media = (Array.isArray(body.images) ? body.images.slice(0, 4) : []).map(d => ({inline_data: {mime_type: 'image/jpeg', data: d}}));
+  return gemini(env, task.prompt(body), media, task.schema);
+}
+
 async function proxyImage(u, cors) {
   if (!/^https:\/\//.test(u || '')) return new Response('bad url', {status: 400, headers: cors});
   const r = await fetch(u, {headers: {'User-Agent': UA, 'Referer': ''}});
@@ -311,6 +334,7 @@ export default {
       }
       if (!ok) return json({error: 'Nicht erlaubt'}, 403, cors);
       if (url.pathname === '/extract' && req.method === 'POST') return json(await extract(await req.json(), env), 200, cors);
+      if (url.pathname === '/enrich' && req.method === 'POST') return json(await enrich(await req.json(), env), 200, cors);
       if (url.pathname === '/img') return proxyImage(url.searchParams.get('u'), cors);
       return json({error: 'Nicht gefunden'}, 404, cors);
     } catch (e) {

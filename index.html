@@ -103,6 +103,12 @@ body.modal-open .fab{display:none}
 .card-img img,.hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .planned-pill,.src-pill{position:absolute;top:10px;background:rgba(255,255,255,.95);color:var(--text);font-size:14px;font-weight:800;padding:4px 10px;border-radius:999px;box-shadow:var(--shadow)}
 .planned-pill{left:10px} .src-pill{right:10px}
+.tools{margin:12px 0 0}
+.tools .btn{flex:1 1 auto;min-height:44px;padding:8px 12px;font-size:15px}
+.nutri{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;background:var(--green-soft);color:var(--green);border-radius:12px;padding:10px 14px;margin-top:10px;font-weight:700}
+.nutri b{font-size:20px}
+.nutri small{flex-basis:100%;font-weight:600;font-size:14px;color:var(--muted)}
+.notes{background:#FFFCF0}
 .serv-step{display:flex !important;align-items:center;justify-content:center;gap:8px}
 .mini-btn{width:44px;height:44px;border-radius:50%;border:2px solid var(--border);background:var(--surface);font-size:20px;font-weight:800;color:var(--accent-press);padding:0}
 .detail-foot .btn{flex:1}
@@ -631,7 +637,7 @@ async function boot(){
 }
 
 let state = seedState();
-const ui = {view:'library', q:'', meal:'all', folder:'all', quick:false, hideChecked:false, servings:{}};
+const ui = {view:'library', q:'', meal:'all', folder:'all', quick:false, hideChecked:false, servings:{}, showOriginal:{}, pantry:''};
 
 const byId = id => state.recipes.find(r => r.id === id);
 const folderById = id => state.folders.find(f => f.id === id);
@@ -684,6 +690,8 @@ function viewLibrary(){
   <div class="chips" role="toolbar" aria-label="Filter">
     ${['all', ...MEAL_TYPES].map(m => `<button class="chip" data-action="filter-meal" data-meal="${m}" aria-pressed="${ui.meal === m}">${m === 'all' ? 'Alle Mahlzeiten' : MEAL_ICON[m] + ' ' + MEAL_LABEL[m]}</button>`).join('')}
     <button class="chip" data-action="toggle-quick" aria-pressed="${ui.quick}">⚡ bis 20 Min.</button>
+    <button class="chip" data-action="what-cook">🧊 Was kann ich kochen?</button>
+    <button class="chip" data-action="random">🎲 Zufall</button>
   </div>
   ${pendingHtml()}
   <div id="lib-results">${libraryResults()}</div>`;
@@ -718,11 +726,14 @@ function card(r){
 }
 
 /* ---------- Detail ---------- */
+const fmtG = g => g == null ? '–' : (Math.round(g * 10) / 10).toString().replace('.', ',') + ' g';
+const stepTexts = r => showTranslated(r) && r.translation.steps.length === r.steps.length ? r.translation.steps : r.steps.map(s => s.text);
 const scaleOf = r => (ui.servings && ui.servings[r.id] || r.servings) / (r.servings || 1);
 function ingViewHtml(r){
   const metric = state.settings.unitMode === 'metric', f = scaleOf(r);
-  return r.ingredients.map(i => {
-    if (!metric && f === 1) return `<li><span>${esc(i.original || composeLine(i))}</span></li>`;
+  const tr = showTranslated(r) ? r.translation.ingredients : null;
+  return r.ingredients.map((i, idx) => {
+    if (!metric && f === 1) return `<li><span>${esc((tr && tr[idx]) || i.original || composeLine(i))}</span></li>`;
     const base = metric ? toMetric(i) : {q:i.quantity, u:i.unit};
     const m = bigUnit({...base, q:base.q == null ? null : (metric && f !== 1 ? roundMetric(base.q * f) : base.q * f)});
     return `<li><span class="q">${esc(qtyUnit(m.q, m.u))}</span><span>${esc(i.name)}${i.note ? `<span class="note">, ${esc(i.note)}</span>` : ''}</span>${m.approx ? `<span class="approx">≈ ${esc(m.approx)}</span>` : ''}</li>`;
@@ -754,6 +765,14 @@ function openDetail(id){
       <div class="badges">${folderBadges(r)}${mealBadges(r)}${(r.tags || []).map(t => `<span class="badge">#${esc(t)}</span>`).join('')}</div>
       ${p.length ? `<p class="planned-note">📅 Geplant: ${esc(p.join(', '))}</p>` : ''}
       ${reviewHtml(r)}
+      <div class="btn-row tools">
+        <button class="btn secondary" data-action="translate" data-id="${esc(r.id)}">🌐 ${r.translation ? (showTranslated(r) ? 'Original zeigen' : 'Deutsch zeigen') : 'Auf Deutsch'}</button>
+        <button class="btn secondary" data-action="nutrition" data-id="${esc(r.id)}">🔢 ${r.nutrition ? 'Neu schätzen' : 'Nährwerte'}</button>
+        <button class="btn secondary" data-action="mark-cooked" data-id="${esc(r.id)}">✅ Heute gekocht</button>
+      </div>
+      ${showTranslated(r) && r.translation.title ? `<p class="lead" style="margin:8px 0 0">🌐 ${esc(r.translation.title)}</p>` : ''}
+      <p class="lead" style="margin:8px 0 0">${r.cooked && r.cooked.length ? `🍳 ${r.cooked.length}× gekocht, zuletzt am ${new Date(r.cooked[r.cooked.length - 1]).toLocaleDateString('de-DE')}` : '🍳 Noch nicht gekocht'}</p>
+      ${r.nutrition ? `<div class="nutri"><b>≈ ${r.nutrition.kcal} kcal</b><span>${fmtG(r.nutrition.protein)} Eiweiß</span><span>${fmtG(r.nutrition.carbs)} Kohlenhydrate</span><span>${fmtG(r.nutrition.fat)} Fett</span>${r.nutrition.fiber != null ? `<span>${fmtG(r.nutrition.fiber)} Ballaststoffe</span>` : ''}<small>pro Portion, von der KI geschätzt${r.nutrition.note ? ' – ' + esc(r.nutrition.note) : ''}</small></div>` : ''}
       <div class="stats">
         <div class="stat">Vorbereitung<b>${fmtMin(r.prepMinutes)}</b></div><div class="stat">Kochen<b>${fmtMin(r.cookMinutes)}</b></div>
         <div class="stat">Portionen<b class="serv-step"><button class="mini-btn" data-action="serv" data-id="${esc(r.id)}" data-d="-1" aria-label="Weniger Portionen">−</button><span>${ui.servings[r.id] || r.servings}</span><button class="mini-btn" data-action="serv" data-id="${esc(r.id)}" data-d="1" aria-label="Mehr Portionen">＋</button></b></div><div class="stat">Niveau<b>${diffHtml(r.difficulty)}</b></div>
@@ -765,7 +784,9 @@ function openDetail(id){
       ${r.steps.length ? '' : `<div class="fill-box"><p>Die Zubereitung stand nicht in der Beschreibung – meist im angepinnten Kommentar. Kommentar kopieren und hier einfügen:</p>
         <textarea id="detail-fill" rows="4" placeholder="Zubereitung hier einfügen"></textarea>
         <div class="btn-row" style="margin-top:8px"><button class="btn secondary" data-action="paste-into" data-target="detail-fill">📋 Einfügen</button><button class="btn primary" data-action="fill-detail" data-id="${esc(r.id)}">✨ Schritte übernehmen</button></div></div>`}
-      <ol class="steps-view">${r.steps.map((s, i) => `<li><span class="n">${i + 1}</span><span>${esc(metric ? fToC(s.text) : s.text)}</span></li>`).join('')}</ol>
+      <ol class="steps-view">${stepTexts(r).map((t, i) => `<li><span class="n">${i + 1}</span><span>${esc(metric ? fToC(t) : t)}</span></li>`).join('')}</ol>
+      <h3 class="section-h">📝 Meine Notizen</h3>
+      <textarea class="notes" data-note-id="${esc(r.id)}" rows="3" placeholder="z. B. weniger Chili, doppelte Menge Sauce …">${esc(r.notes || '')}</textarea>
       ${r.sourceUrl ? `<p>${(PLATFORMS[r.sourcePlatform] || PLATFORMS.web).icon} Quelle: <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener noreferrer">${esc((PLATFORMS[r.sourcePlatform] || PLATFORMS.web).label)} öffnen</a></p>` : ''}
     </div>
     <div class="sheet-foot detail-foot">
@@ -780,16 +801,20 @@ function openDetail(id){
 /* ---------- Teilen: das ganze Rezept steckt komprimiert im Link, kein Konto nötig ---------- */
 const shareLinks = {};
 const b64url = buf => { let bin = ''; buf.forEach(b => bin += String.fromCharCode(b)); return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
-async function packRecipe(r){
-  const data = {v:1, t:r.title, d:r.description, e:r.emoji, s:r.servings, p:r.prepMinutes, c:r.cookMinutes, df:r.difficulty, m:r.mealTypes, g:r.tags,
-    i:r.ingredients.map(x => [x.original || '', x.quantity, x.unit, x.name, x.note || '', x.aisle]), st:r.steps.map(s => s.text), u:r.sourceUrl || '', im:r.imageSrc || ''};
-  const stream = new Blob([JSON.stringify(data)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+async function compress(obj){
+  const stream = new Blob([JSON.stringify(obj)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
   return b64url(new Uint8Array(await new Response(stream).arrayBuffer()));
 }
-async function unpackRecipe(code){
+async function decompress(code){
   const bin = atob(code.replace(/-/g, '+').replace(/_/g, '/'));
   const stream = new Blob([Uint8Array.from(bin, c => c.charCodeAt(0))]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-  const d = JSON.parse(await new Response(stream).text());
+  return JSON.parse(await new Response(stream).text());
+}
+const recipeToShare = r => ({v:1, t:r.title, d:r.description, e:r.emoji, s:r.servings, p:r.prepMinutes, c:r.cookMinutes, df:r.difficulty, m:r.mealTypes, g:r.tags,
+  i:r.ingredients.map(x => [x.original || '', x.quantity, x.unit, x.name, x.note || '', x.aisle]), st:r.steps.map(s => s.text), u:r.sourceUrl || '', im:r.imageSrc || ''});
+const packRecipe = r => compress(recipeToShare(r));
+const unpackRecipe = async code => shareToRecipe(await decompress(code));
+function shareToRecipe(d){
   return {id:uid(), title:String(d.t || 'Rezept').slice(0, 120), description:d.d || '', emoji:d.e || '🍽️', image:'', imageSrc:d.im || '',
     servings:+d.s || 2, prepMinutes:+d.p || 0, cookMinutes:+d.c || 0, difficulty:DIFFS.includes(d.df) ? d.df : 'easy', mealTypes:d.m || [], tags:d.g || [], folderIds:[],
     ingredients:(d.i || []).map(([original, quantity, unit, name, note, aisle]) => ({id:uid(), original, quantity, unit:UNIT[unit] ? unit : 'pc', name, note, aisle:AISLE[aisle] ? aisle : guessAisle(name)})),
@@ -835,6 +860,144 @@ async function saveShared(){
   sharedDraft = null;
 }
 
+/* ---------- Ordner teilen ---------- */
+async function shareFolder(fid){
+  const f = folderById(fid); if (!f) return;
+  const list = state.recipes.filter(r => (r.folderIds || []).includes(fid));
+  if (!list.length) { toast('Der Ordner ist leer.'); return; }
+  const url = shareLinks['f:' + fid] || `${appUrl()}#f=${await compress({v:1, f:{n:f.name, e:f.emoji}, rs:list.map(recipeToShare)})}`;
+  if (navigator.share) {
+    try { await navigator.share({title:f.name, text:`${f.emoji} ${f.name} – ${list.length} Rezepte für dich`, url}); return; }
+    catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const ta = document.createElement('textarea'); ta.value = url; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta);
+  await copyText(url, ta); ta.remove();
+  toast('🔗 Link kopiert – z. B. in WhatsApp einfügen');
+}
+let sharedFolder = null;
+async function openSharedFolder(code){
+  let d; try { d = await decompress(code); } catch { toast('⚠ Der geteilte Link ist unvollständig.'); return; }
+  sharedFolder = {name:String(d.f && d.f.n || 'Geteilte Rezepte').slice(0, 40), emoji:d.f && d.f.e || '📁', recipes:(d.rs || []).map(shareToRecipe)};
+  const s = sharedFolder;
+  openModal({cls:'sheet', html:`
+    <div class="sheet-head"><button class="icon-btn" data-action="close-modal" aria-label="Schließen">✕</button><h2>${esc(s.emoji)} ${esc(s.name)}</h2><span style="width:48px"></span></div>
+    <div class="sheet-body"><p class="lead">${s.recipes.length} Rezepte wurden mit dir geteilt.</p>
+      ${s.recipes.map(r => `<div class="pick-item" style="cursor:default"><span class="slot-emoji">${esc(r.emoji)}</span><span class="slot-text"><strong>${esc(r.title)}</strong><span class="slot-meta">⏱ ${fmtMin(totalMin(r))} · ${r.ingredients.length} Zutaten</span></span></div>`).join('')}</div>
+    <div class="sheet-foot"><button class="btn primary" data-action="save-shared-folder">💾 Alle in den Ordner „${esc(s.name)}“</button></div>`});
+}
+async function saveSharedFolder(){
+  const s = sharedFolder; if (!s) return;
+  closeModal();
+  let folder = state.folders.find(f => f.name.toLowerCase() === s.name.toLowerCase());
+  if (!folder) { folder = {id:uid(), name:s.name, emoji:s.emoji}; state.folders.push(folder); }
+  const now = new Date().toISOString(), added = [];
+  for (const r of s.recipes) {
+    const dup = r.sourceUrl && state.recipes.find(x => x.sourceUrl && sameLink(x.sourceUrl, r.sourceUrl));
+    if (dup) { if (!dup.folderIds.includes(folder.id)) dup.folderIds.push(folder.id); continue; }
+    Object.assign(r, {folderIds:[folder.id], createdAt:now, updatedAt:now});
+    state.recipes.push(r); added.push(r);
+  }
+  ui.view = 'library'; ui.folder = folder.id; save(); render();
+  toast(`✅ ${added.length} Rezepte im Ordner „${folder.name}“`);
+  sharedFolder = null;
+  for (const r of added) if (r.imageSrc) { r.image = await fetchImageData(r.imageSrc); save(); render(); }
+}
+
+/* ---------- Was kann ich kochen? ---------- */
+const SYN = [['hähnchen','huhn','hühnchen','chicken'],['ei','eier','egg'],['milch','milk'],['mehl','flour'],['zwiebel','onion','shallot','schalotte'],['knoblauch','garlic'],
+  ['tomate','tomato'],['kartoffel','potato'],['reis','rice'],['nudel','pasta','spaghetti','penne'],['käse','cheese','parmesan','cheddar','mozzarella','feta'],['sahne','cream'],
+  ['paprika','bell pepper'],['karotte','möhre','carrot'],['spinat','spinach'],['zitrone','lemon'],['limette','lime'],['lachs','salmon'],['garnele','shrimp','prawn'],
+  ['rind','beef','steak','short rib'],['hack','mince'],['joghurt','yogurt','yoghurt'],['honig','honey'],['haferflocken','oat'],['linse','lentil'],['kürbis','pumpkin'],
+  ['ingwer','ginger'],['sojasauce','soy sauce'],['brühe','stock','broth'],['butter'],['tofu'],['gnocchi'],['banane','banana'],['apfel','apple'],['gurke','cucumber'],
+  ['salat','lettuce','romaine'],['brot','bread','tortilla'],['speck','bacon'],['pilz','champignon','mushroom'],['zucchini'],['brokkoli','broccoli'],['avocado'],['bohne','bean']];
+// Vorräte, die fast jeder hat, zählen nicht als „fehlt“
+const isStaple = n => /(^|\s)(salz|salt|pfeffer|black pepper|wasser|water|zucker|sugar)$/.test(n) || /(öl|oil)$/.test(n);
+function canon(word){
+  const w = normName(word);
+  for (const g of SYN) if (g.some(s => w.includes(s))) return g[0];
+  return w;
+}
+function matchRecipes(items){
+  const have = items.map(canon).filter(Boolean);
+  return state.recipes.map(r => {
+    const ings = r.ingredients.filter(i => !isStaple(normName(i.name)) && i.unit !== 'taste');
+    const got = [], miss = [];
+    for (const i of ings) { const c = canon(i.name); (have.some(h => c.includes(h) || h.includes(c)) ? got : miss).push(i.name); }
+    return {r, got, miss, ratio:ings.length ? got.length / ings.length : 0};
+  }).filter(x => x.got.length).sort((a, b) => a.miss.length - b.miss.length || b.ratio - a.ratio).slice(0, 20);
+}
+function openWhatCook(){
+  openModal({cls:'sheet', html:`
+    <div class="sheet-head"><button class="icon-btn" data-action="close-modal" aria-label="Schließen">✕</button><h2>🧊 Was kann ich kochen?</h2><span style="width:48px"></span></div>
+    <div class="sheet-body">
+      <label class="flabel" for="wc-text">Was hast du da? <span class="opt">(mit Komma getrennt)</span></label>
+      <textarea id="wc-text" rows="3" placeholder="z. B. Eier, Spinat, Käse, Nudeln">${esc(ui.pantry || '')}</textarea>
+      <div class="btn-row" style="margin:10px 0 16px"><button class="btn primary" data-action="wc-find" style="flex:1">🔍 Rezepte finden</button>
+        <label class="btn secondary" style="flex:1;cursor:pointer">📷 Kühlschrank-Foto<input type="file" id="pantry-file" accept="image/*" multiple hidden></label></div>
+      <div id="wc-results"></div>
+    </div>`});
+  if (ui.pantry) whatCookResults();
+}
+function whatCookResults(){
+  const ta = document.getElementById('wc-text'); if (!ta) return;
+  ui.pantry = ta.value;
+  const items = ta.value.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean);
+  const box = document.getElementById('wc-results');
+  if (!items.length) { box.innerHTML = ''; return; }
+  const hits = matchRecipes(items);
+  box.innerHTML = hits.length ? hits.map(h => `<button class="pick-item" data-action="view-recipe" data-id="${esc(h.r.id)}">
+      <span class="slot-emoji" aria-hidden="true">${esc(h.r.emoji || '🍽️')}</span>
+      <span class="slot-text"><strong>${esc(h.r.title)}</strong><span class="slot-meta">${h.miss.length ? `✓ ${h.got.length} von ${h.got.length + h.miss.length} da · fehlt: ${esc(h.miss.slice(0, 4).join(', '))}${h.miss.length > 4 ? ' …' : ''}` : '✅ Alles da!'}</span></span></button>`).join('')
+    : '<p class="lead">Kein Rezept passt. Probier weniger spezielle Begriffe.</p>';
+}
+async function pantryFromPhotos(files){
+  const list = [...files].filter(f => f.type.startsWith('image/')).slice(0, 4);
+  if (!list.length) return;
+  const p = progressSheet('Kühlschrank wird angeschaut…');
+  try {
+    const images = []; for (const f of list) images.push(await shrinkImage(f, 1280, 0.8));
+    const res = await api('/enrich', {task:'pantry', images});
+    p.close();
+    const ta = document.getElementById('wc-text');
+    const old = ta.value.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean);
+    ta.value = [...new Set([...old, ...(res.items || [])])].join(', ');
+    whatCookResults();
+    toast(`📷 ${(res.items || []).length} Lebensmittel erkannt`);
+  } catch (e) { p.close(); toast('⚠ ' + e.message); }
+}
+
+/* ---------- Übersetzen, Nährwerte, Notizen, Gekocht ---------- */
+async function translateRecipe(id){
+  const r = byId(id); if (!r) return;
+  if (r.translation) { ui.showOriginal[id] = !ui.showOriginal[id]; refreshDetail(); return; }
+  const p = progressSheet('Wird übersetzt…');
+  try {
+    const t = await api('/enrich', {task:'translate', lang:'German', title:r.title, ingredients:r.ingredients.map(i => i.original || composeLine(i)), steps:r.steps.map(s => s.text)});
+    p.close();
+    if (!t.ingredients || t.ingredients.length !== r.ingredients.length) throw new Error('Übersetzung unvollständig – bitte nochmal versuchen');
+    r.translation = {lang:'de', title:t.title, ingredients:t.ingredients, steps:t.steps}; ui.showOriginal[id] = false;
+    save(); refreshDetail(); render();
+  } catch (e) { p.close(); toast('⚠ ' + e.message); }
+}
+async function nutritionFor(id){
+  const r = byId(id); if (!r) return;
+  const p = progressSheet('Nährwerte werden geschätzt…');
+  try {
+    const n = await api('/enrich', {task:'nutrition', servings:r.servings, ingredients:r.ingredients.map(i => i.original || composeLine(i))});
+    p.close();
+    r.nutrition = {kcal:n.kcal, protein:n.protein, carbs:n.carbs, fat:n.fat, fiber:n.fiber, note:n.note || '', at:new Date().toISOString()};
+    save(); refreshDetail();
+  } catch (e) { p.close(); toast('⚠ ' + e.message); }
+}
+const showTranslated = r => !!(r.translation && !ui.showOriginal[r.id]);
+function markCooked(id, silent){
+  const r = byId(id); if (!r) return;
+  r.cooked = [...(r.cooked || []), new Date().toISOString()];
+  save(); if (!silent) { refreshDetail(); toast('✅ Als gekocht eingetragen'); }
+}
+let noteTimer;
+function saveNote(id, text){ const r = byId(id); if (!r) return; r.notes = text; clearTimeout(noteTimer); noteTimer = setTimeout(save, 400); }
+
 /* ---------- Kochmodus: ein Schritt pro Seite, Bildschirm bleibt an, Timer aus dem Text ---------- */
 const cook = {id:null, step:0, wake:null, timers:[]};
 function stepTimers(text){
@@ -859,7 +1022,7 @@ function cookHtml(){
     <div class="sheet-body cook-body" id="cook-body">
       ${cook.timers.length ? `<div class="cook-timers">${cook.timers.map(t => `<button class="timer-chip ${t.left <= 0 ? 'done' : ''}" data-action="stop-timer" data-id="${t.id}">⏱ ${t.left > 0 ? fmtClock(t.left) : 'Fertig!'} · ${esc(t.label)} ✕</button>`).join('')}</div>` : ''}
       <div id="cook-ings" class="cook-ings" hidden><ul class="ing-view">${ingViewHtml(r)}</ul>${f !== 1 ? `<p class="lead">Für ${ui.servings[r.id]} Portionen.</p>` : ''}</div>
-      <p class="cook-step">${esc(state.settings.unitMode === 'metric' ? fToC(s.text) : s.text)}</p>
+      <p class="cook-step">${esc(state.settings.unitMode === 'metric' ? fToC(stepTexts(r)[cook.step]) : stepTexts(r)[cook.step])}</p>
       ${timers.length ? `<div class="btn-row">${timers.map(t => `<button class="btn secondary" data-action="start-timer" data-secs="${t.secs}" data-label="${esc(t.label)}">⏱ ${esc(t.label)} starten</button>`).join('')}</div>` : ''}
     </div>
     <div class="sheet-foot">
@@ -879,7 +1042,7 @@ async function openCook(id){
 function renderCook(){ const dlg = document.querySelector('.modal.cook'); if (dlg) { const open = !document.getElementById('cook-ings')?.hidden; dlg.innerHTML = cookHtml(); if (open) document.getElementById('cook-ings').hidden = false; } }
 function moveCook(d){
   const r = byId(cook.id); if (!r) return;
-  if (d > 0 && cook.step === r.steps.length - 1) { closeCook(); toast('🎉 Guten Appetit!'); return; }
+  if (d > 0 && cook.step === r.steps.length - 1) { closeCook(); markCooked(r.id, true); toast('🎉 Guten Appetit! Als gekocht eingetragen.'); return; }
   cook.step = Math.max(0, Math.min(r.steps.length - 1, cook.step + d)); renderCook();
 }
 function closeCook(){ if (cook.wake) { cook.wake.release().catch(() => {}); cook.wake = null; } closeModal(); }
@@ -1142,6 +1305,7 @@ function openFolderManager(){
   const body = () => state.folders.length ? state.folders.map(f => {
     const n = state.recipes.filter(r => (r.folderIds || []).includes(f.id)).length;
     return `<div class="pick-item" style="cursor:default"><span class="slot-emoji">${esc(f.emoji)}</span><span class="slot-text" style="flex:1"><strong>${esc(f.name)}</strong><span class="slot-meta">${n} Rezept${n === 1 ? '' : 'e'}</span></span>
+      <button class="icon-btn" data-action="share-folder" data-id="${esc(f.id)}" aria-label="${esc(f.name)} teilen">📤</button>
       <button class="icon-btn" data-action="edit-folder" data-id="${esc(f.id)}" aria-label="${esc(f.name)} umbenennen">✏️</button>
       <button class="icon-btn danger" data-action="delete-folder" data-id="${esc(f.id)}" aria-label="${esc(f.name)} löschen">🗑</button></div>`;
   }).join('') : '<p class="lead">Noch keine Ordner.</p>';
@@ -1150,6 +1314,11 @@ function openFolderManager(){
     <div class="sheet-body"><div id="folder-list">${body()}</div><button class="btn primary block" data-action="new-folder">＋ Neuer Ordner</button>
     <p class="lead" style="margin-top:12px;font-size:15px">Ordner löschen entfernt nur die Zuordnung – die Rezepte bleiben erhalten.</p></div>`});
   refreshFolderManager = () => { const el = document.getElementById('folder-list'); if (el) el.innerHTML = body(); };
+  // Links vorab bauen, damit das Teilen-Menü direkt beim Tippen aufgeht
+  for (const f of state.folders) {
+    const list = state.recipes.filter(r => (r.folderIds || []).includes(f.id));
+    if (list.length) compress({v:1, f:{n:f.name, e:f.emoji}, rs:list.map(recipeToShare)}).then(c => { shareLinks['f:' + f.id] = `${appUrl()}#f=${c}`; }).catch(() => {});
+  }
 }
 let refreshFolderManager = () => {};
 
@@ -1702,6 +1871,7 @@ async function applyFill(form){
 /* Aufruf durch den Kurzbefehl: …/#import?u=<Link> */
 function handleIncoming(){
   const h = location.hash;
+  if (h.startsWith('#f=')) { history.replaceState(null, '', location.pathname + location.search); while (modalStack.length) closeModal(); openSharedFolder(h.slice(3)); return; }
   if (h.startsWith('#r=')) { history.replaceState(null, '', location.pathname + location.search); while (modalStack.length) closeModal(); openShared(h.slice(3)); return; }
   if (!h.startsWith('#import')) return;
   const params = new URLSearchParams(h.slice(h.indexOf('?') + 1));
@@ -1893,6 +2063,14 @@ const actions = {
   'toggle-hide': () => { ui.hideChecked = !ui.hideChecked; render(); },
   'uncheck-all': () => { state.checked = {}; save(); render(); },
   'copy-list': () => { const ta = document.getElementById('g-export'); copyText(ta.value, ta); },
+  'share-folder': el => shareFolder(el.dataset.id),
+  'save-shared-folder': () => saveSharedFolder(),
+  'what-cook': () => openWhatCook(),
+  'wc-find': () => whatCookResults(),
+  'random': () => { const list = filteredRecipes(); if (!list.length) { toast('Keine Rezepte im Filter.'); return; } openDetail(list[Math.floor(Math.random() * list.length)].id); },
+  'translate': el => translateRecipe(el.dataset.id),
+  'nutrition': el => nutritionFor(el.dataset.id),
+  'mark-cooked': el => markCooked(el.dataset.id),
   'retry-import': el => { const j = state.pending.find(p => p.id === el.dataset.id); if (j) runImport(j); },
   'fix-import': el => { const j = state.pending.find(p => p.id === el.dataset.id); if (!j) return; state.pending = state.pending.filter(p => p.id !== j.id); save(); render(); importFailed(j.link, j.error); },
   'drop-import': el => { state.pending = state.pending.filter(p => p.id !== el.dataset.id); save(); render(); },
@@ -1937,11 +2115,13 @@ document.addEventListener('click', e => {
 document.addEventListener('input', e => {
   if (e.target.id === 'q') { ui.q = e.target.value; document.getElementById('lib-results').innerHTML = libraryResults(); }
   else if (e.target.id === 'pick-q') document.getElementById('pick-list').innerHTML = pickerList(e.target.value);
+  else if (e.target.dataset.noteId) saveNote(e.target.dataset.noteId, e.target.value);
 });
 document.addEventListener('change', e => {
   if (e.target.dataset.gkey) { const k = e.target.dataset.gkey; if (e.target.checked) state.checked[k] = true; else delete state.checked[k]; save(); render(); }
   if (e.target.id === 'backup-file' && e.target.files[0]) importBackup(e.target.files[0]);
   if (e.target.id === 'img-file' && e.target.files.length) { const files = [...e.target.files]; importImages(files, e.target.dataset.link || ''); e.target.value = ''; }
+  if (e.target.id === 'pantry-file' && e.target.files.length) { const files = [...e.target.files]; e.target.value = ''; pantryFromPhotos(files); }
   if (e.target.id === 'analyze-video') { state.settings.analyzeVideo = e.target.checked; save(); }
 });
 document.addEventListener('keydown', e => {
