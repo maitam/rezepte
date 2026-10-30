@@ -244,6 +244,84 @@ async function workersAI(env, text) {
   return JSON.parse(m[0]);
 }
 
+/* ---------- Verlinkte Rezeptseiten und Kommentare ---------- */
+// Für fremde Rezeptseiten ein ehrlicher User-Agent; wer uns mit 403 abweist, wird nicht umgangen.
+const BOT_UA = 'MiseEnPlace-Rezeptimport/1.0 (+https://maitam.github.io/rezepte/; privater Rezept-Import)';
+const SKIP_HOSTS = /(^|\.)(instagram|tiktok|youtube|youtu|facebook|fb|twitter|x|threads|amazon|amzn|patreon|spotify|apple|pinterest|linktr|beacons|snapchat|discord|twitch|paypal|ko-fi|buymeacoffee|whatsapp|t)\.(com|be|me|to|ee|ai|co|net|de)$/i;
+const isPrivateHost = h => /^(localhost|.*\.local|.*\.internal|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|\[?f[cd][0-9a-f]{2}:)/i.test(h);
+function checkUrl(u) {
+  let url; try { url = new URL(u); } catch { return null; }
+  if (!/^https?:$/.test(url.protocol) || isPrivateHost(url.hostname) || url.username || url.password) return null;
+  return url;
+}
+// Abruf mit Prüfung jeder Weiterleitung, Zeit- und Größenlimit.
+export async function safeFetch(u, {maxBytes = 2_000_000, ua = BOT_UA} = {}) {
+  let url = checkUrl(u);
+  for (let hop = 0; url && hop <= 4; hop++) {
+    const res = await fetch(url.href, {headers: {'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'de,en;q=0.8'}, redirect: 'manual', signal: AbortSignal.timeout(8000)});
+    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) { url = checkUrl(new URL(res.headers.get('location'), url).href); continue; }
+    if (!res.ok) return {url: url.href, status: res.status, html: ''};
+    if (!/html|xml/i.test(res.headers.get('content-type') || '')) return {url: url.href, status: res.status, html: ''};
+    const reader = res.body.getReader(); const chunks = []; let size = 0;
+    while (true) { const {done, value} = await reader.read(); if (done) break; size += value.length; if (size > maxBytes) { reader.cancel(); break; } chunks.push(value); }
+    const buf = new Uint8Array(size > maxBytes ? chunks.reduce((a, c) => a + c.length, 0) : size); let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
+    return {url: url.href, status: res.status, html: new TextDecoder().decode(buf)};
+  }
+  return null;
+}
+function pageText(html) {
+  const body = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<nav[\s\S]*?<\/nav>|<footer[\s\S]*?<\/footer>/gi, ' ').replace(/<(br|p|li|h\d|div|tr)[^>]*>/gi, '\n').replace(/<[^>]+>/g, ' ');
+  return decodeEntities(body).split('\n').map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+}
+const amountCount = t => (t.match(/^\s*[-•*▢]?\s*(\d|½|¼|¾|⅓)[^\n]{2,}/gm) || []).length + (t.match(/\d+\s*(g|ml|tbsp|tsp|cups?|el|tl)\b/gi) || []).length;
+// Zubereitung gilt nur als vorhanden, wenn wirklich Schritte dastehen – nicht bei „Method in den Kommentaren“.
+function hasMethod(t) {
+  if (/\b(step|schritt)\s*1\b[\s\S]*\b(step|schritt)\s*2\b/i.test(t)) return true;
+  const lines = String(t).split('\n');
+  if (lines.filter(l => /^\s*(\d{1,2}[.):]|step\s*\d|schritt\s*\d)\s*\S/i.test(l)).length >= 2) return true;
+  const i = lines.findIndex(l => /^\W*(method|instructions?|directions?|zubereitung|anleitung|so geht'?s)\b/i.test(l));
+  return i >= 0 && lines.slice(i + 1).filter(l => l.trim().length >= 40 && !/^\s*#/.test(l)).length >= 2;
+}
+const looksComplete = t => amountCount(t) >= 4 && hasMethod(t);
+
+export async function linkedRecipe(caption) {
+  const lines = String(caption).split('\n');
+  const cands = [];
+  for (const line of lines) for (const m of line.matchAll(/https?:\/\/[^\s<>"'）)]+/g)) {
+    const u = m[0].replace(/[.,!?:;]+$/, '');
+    let score = 0;
+    if (/recipe|rezept|recette|receta/i.test(u)) score += 3;
+    if (/recipe|rezept|full|ganze|link|website|blog|ingredients|zutaten|anleitung/i.test(line)) score += 2;
+    cands.push({u, score});
+  }
+  const seen = new Set();
+  const list = cands.filter(c => !seen.has(c.u) && seen.add(c.u)).sort((a, b) => b.score - a.score).slice(0, 4);
+  for (const c of list) {
+    let r; try { r = await safeFetch(c.u); } catch { continue; }
+    if (!r || !r.html) continue;
+    const host = new URL(r.url).hostname.replace(/^www\./, '');
+    if (SKIP_HOSTS.test(host)) continue;
+    const ld = ldRecipeText(r.html);
+    if (ld) return {url: r.url, host, text: ld.text, title: ld.title, image: ld.image || meta(r.html, 'og:image'), structured: true};
+    const text = pageText(r.html);
+    if (/ingredients|zutaten/i.test(text) && amountCount(text) >= 3) {
+      const start = Math.max(0, text.search(/ingredients|zutaten/i) - 1500);
+      return {url: r.url, host, text: text.slice(start, start + 12000), title: meta(r.html, 'og:title'), image: meta(r.html, 'og:image'), structured: false};
+    }
+  }
+  return null;
+}
+// YouTube: Kommentare des Kanal-Inhabers (der angepinnte steht praktisch immer oben). Nur mit YOUTUBE_API_KEY.
+export async function youtubeOwnerComment(id, key) {
+  const api = (path, q) => fetch(`https://www.googleapis.com/youtube/v3/${path}?${new URLSearchParams({...q, key})}`, {signal: AbortSignal.timeout(8000)}).then(r => r.json());
+  const v = await api('videos', {part: 'snippet', id});
+  const channel = v.items && v.items[0] && v.items[0].snippet.channelId;
+  if (!channel) return '';
+  const c = await api('commentThreads', {part: 'snippet', videoId: id, order: 'relevance', maxResults: '30', textFormat: 'plainText'});
+  const own = (c.items || []).map(t => t.snippet.topLevelComment.snippet).filter(s => s.authorChannelId && s.authorChannelId.value === channel);
+  return own.map(s => s.textOriginal || s.textDisplay).filter(t => t && t.length > 40).slice(0, 2).join('\n\n');
+}
+
 export async function extract(body, env) {
   const link = firstUrl(body.link) || firstUrl(body.text);
   const images = Array.isArray(body.images) ? body.images.slice(0, 10) : [];
@@ -253,12 +331,28 @@ export async function extract(body, env) {
     catch (e) { page.error = 'Seite nicht erreichbar: ' + e.message; }
   }
   const extraText = String(body.text || '').replace(link, '').trim();
-  const text = [page.caption, extraText].filter(Boolean).join('\n\n');
-  const result = {...page, recipe: null, ai: null, aiMode: '', aiError: ''};
-  // Video nur ansehen, wenn die Beschreibung kein Rezept enthält (spart 1–2 Minuten).
-  const amountLines = (text.match(/^\s*[-•*]?\s*(\d|½|¼|¾|⅓)[^\n]{2,}/gm) || []).length + (text.match(/\d+\s*(g|ml|tbsp|tsp|cups?|el|tl)\b/gi) || []).length;
-  const captionHasRecipe = amountLines >= 4;
-  const useVideo = page.platform === 'youtube' && page.videoUrl && body.video !== false && !captionHasRecipe;
+  const sourcesUsed = [];
+  let linked = null, comment = '';
+  // Steht das Rezept nicht vollständig in der Beschreibung: verlinkte Rezeptseite und Kommentar des Erstellers holen.
+  const own = [page.caption, extraText].filter(Boolean).join('\n');
+  if (own && !looksComplete(own) && page.platform !== 'web') {
+    linked = await linkedRecipe(own).catch(() => null);
+    if (linked) { sourcesUsed.push(`verlinkte Seite (${linked.host})`); if (!page.imageUrl) page.imageUrl = linked.image; }
+  }
+  if (page.platform === 'youtube' && env.YOUTUBE_API_KEY && !linked && !looksComplete(page.caption + '\n' + extraText)) {
+    const id = youtubeId(page.finalUrl || link) || youtubeId(link);
+    comment = id ? await youtubeOwnerComment(id, env.YOUTUBE_API_KEY).catch(() => '') : '';
+    if (comment) sourcesUsed.push('Kommentar des Erstellers');
+  }
+  const parts = [];
+  if (linked) parts.push(`=== LINKED RECIPE PAGE (${linked.host}) – the full recipe; take ingredients and steps from here ===\n${linked.text}`);
+  if (page.caption) parts.push(`=== POST CAPTION / VIDEO DESCRIPTION ===\n${page.caption}`);
+  if (comment) parts.push(`=== COMMENT BY THE CREATOR (often contains the method) ===\n${comment}`);
+  if (extraText) parts.push(`=== TEXT PASTED BY THE USER ===\n${extraText}`);
+  const text = parts.join('\n\n');
+  const result = {...page, caption: text, recipe: null, ai: null, aiMode: '', aiError: '', recipeUrl: linked ? linked.url : '', sources: sourcesUsed};
+  // Video nur ansehen, wenn sonst kein Rezept da ist (spart 1–2 Minuten).
+  const useVideo = page.platform === 'youtube' && page.videoUrl && body.video !== false && amountCount(text) < 4;
   if (images.length && !text && !env.GEMINI_API_KEY) { result.aiError = 'Fotos kann der Server erst lesen, wenn Gemini eingerichtet ist.'; return result; }
   if (!text && !images.length && !(useVideo && env.GEMINI_API_KEY)) {
     result.aiError = page.loginWall ? 'Instagram verlangt gerade einen Login – Beschreibung nicht lesbar. In ein paar Minuten nochmal versuchen.'
@@ -266,20 +360,21 @@ export async function extract(body, env) {
       : (page.error || 'Keine Beschreibung gefunden.');
     return result;
   }
-  const prompt = `${PROMPT}\n\nSOURCE URL: ${link || '-'}\nVIDEO TITLE: ${page.title || '-'}\n\nTEXT:\n${text || '(no text – use the attached media)'}`;
+  const prompt = `${PROMPT}\n16. If a LINKED RECIPE PAGE section is present, it is the authoritative full recipe: take ingredients and steps from it (original = its exact line). Use the caption only for details missing there.\n\nSOURCE URL: ${link || '-'}\nVIDEO TITLE: ${page.title || '-'}\n\nTEXT:\n${text || '(no text – use the attached media)'}`;
+  const label = base => [base, ...sourcesUsed].join(' + ');
   if (env.GEMINI_API_KEY) {
     const media = images.map(d => ({inline_data: {mime_type: 'image/jpeg', data: d}}));
     if (useVideo) {
-      try { result.recipe = await gemini(env, prompt, [{file_data: {file_uri: page.videoUrl}}, ...media]); result.ai = 'gemini'; result.aiMode = 'Video + Ton + Beschreibung'; }
+      try { result.recipe = await gemini(env, prompt, [{file_data: {file_uri: page.videoUrl}}, ...media]); result.ai = 'gemini'; result.aiMode = label('Video + Ton + Beschreibung'); }
       catch (e) { result.aiError = 'Video: ' + e.message; }
     }
     if (!result.recipe) {
-      try { result.recipe = await gemini(env, prompt, media); result.ai = 'gemini'; result.aiMode = images.length ? `${images.length} Bild(er)` : 'Beschreibung'; }
+      try { result.recipe = await gemini(env, prompt, media); result.ai = 'gemini'; result.aiMode = label(images.length ? `${images.length} Bild(er)` : 'Beschreibung'); }
       catch (e) { result.aiError = (result.aiError ? result.aiError + ' · ' : '') + e.message; }
     }
   }
   if (!result.recipe && env.AI && text) {
-    try { result.recipe = await workersAI(env, prompt); result.ai = 'workers-ai'; result.aiMode = 'Beschreibung'; }
+    try { result.recipe = await workersAI(env, prompt); result.ai = 'workers-ai'; result.aiMode = label('Beschreibung'); }
     catch (e) { result.aiError = (result.aiError ? result.aiError + ' · ' : '') + 'Workers AI: ' + e.message; }
   }
   return result;

@@ -788,6 +788,7 @@ function openDetail(id){
       <h3 class="section-h">📝 Meine Notizen</h3>
       <textarea class="notes" data-note-id="${esc(r.id)}" rows="3" placeholder="z. B. weniger Chili, doppelte Menge Sauce …">${esc(r.notes || '')}</textarea>
       ${r.sourceUrl ? `<p>${(PLATFORMS[r.sourcePlatform] || PLATFORMS.web).icon} Quelle: <a href="${esc(r.sourceUrl)}" target="_blank" rel="noopener noreferrer">${esc((PLATFORMS[r.sourcePlatform] || PLATFORMS.web).label)} öffnen</a></p>` : ''}
+      ${r.recipeUrl ? `<p>📄 Rezept übernommen von: <a href="${esc(r.recipeUrl)}" target="_blank" rel="noopener noreferrer">${esc(r.recipeUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0])}</a></p>` : ''}
     </div>
     <div class="sheet-foot detail-foot">
       <button class="icon-btn danger" data-action="delete-recipe" data-id="${esc(r.id)}" aria-label="Löschen">🗑</button>
@@ -1740,6 +1741,7 @@ async function runImport(job, images = []){
     if (!res.draft.title && data.title) res.draft.title = cleanTitle(data.title);
     if (data.aiError) res.report.push({ok:false, label:'Hinweis', detail:data.aiError});
     res.draft.imageSrc = data.imageUrl || '';
+    res.draft.recipeUrl = data.recipeUrl || '';
     if (data.imageUrl) res.draft.image = await fetchImageData(data.imageUrl);
     if (!res.draft.image && job.cover) res.draft.image = job.cover;
     const rec = autoSave(res);
@@ -1782,7 +1784,7 @@ function autoSave(res){
   const rec = {id:uid(), title:d.title || 'Neues Rezept', description:d.description || '', emoji:d.emoji || '🍽️', image:d.image || '', imageSrc:d.imageSrc || '',
     servings:+d.servings > 0 ? +d.servings : 2, prepMinutes:+d.prepMinutes || 0, cookMinutes:+d.cookMinutes || 0,
     difficulty:DIFFS.includes(d.difficulty) ? d.difficulty : 'easy', mealTypes:d.mealTypes || [], tags:d.tags || [], folderIds:d.folderIds || [],
-    ingredients, steps, sourceUrl:d.sourceUrl || '', sourcePlatform:d.sourcePlatform || '', createdAt:now, updatedAt:now,
+    ingredients, steps, sourceUrl:d.sourceUrl || '', sourcePlatform:d.sourcePlatform || '', recipeUrl:d.recipeUrl || '', createdAt:now, updatedAt:now,
     review:{confidence:d._confidence ?? null, via:(res.report[0] || {}).detail || '', notes:res.report.filter(r => r.label === 'Hinweis').map(r => r.detail), issues, missingSteps:!steps.length}};
   state.recipes.push(rec);
   return rec;
